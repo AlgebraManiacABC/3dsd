@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 from .config import ProjectConfig
-from .elf import ELF
+from .elf import write_target_elf
 from .util import Symbol
 
 
@@ -15,20 +15,22 @@ def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
     result = []
     cur = 0
     idx = 0
+    last_segment = '.text'
 
     while idx < len(addrs) or cur < bin_size:
         if idx >= len(addrs):
-            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', bin_size - cur, '.text'))
+            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', bin_size - cur, last_segment))
             break
         elif cur == addrs[idx]:
             sym = sym_dict[cur]
             next_addr = addrs[idx + 1] if idx + 1 < len(addrs) else bin_size
             size = min(sym.size, next_addr - cur)
             result.append(Symbol(cur, sym.name, sym.mode, size, sym.segment))
+            last_segment = sym.segment
             cur += size
             idx += 1
         elif cur < addrs[idx]:
-            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', addrs[idx] - cur, '.text'))
+            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', addrs[idx] - cur, last_segment))
             cur = addrs[idx]
         else:
             raise RuntimeError(f"Address tracking error at {cur:08x}")
@@ -43,9 +45,8 @@ def generate_target_elfs(config: ProjectConfig):
     for name in config.binaries:
         data = config.binaries[name].data
         syms = _complete_symbols(config.symbols.get(name, []), len(data))
-        elf = ELF.from_bytes_multi(data, 0, syms)
         out = target_dir / name
-        elf.write(out)
+        write_target_elf(out, data, syms)
         print(f"  {name}: {len(data):,} bytes, {len(syms)} symbols -> {out}")
 
 

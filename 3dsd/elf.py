@@ -465,3 +465,128 @@ class ELF:
             if (self.data[i] & m) != (other.data[i] & m):
                 return False
         return True
+
+
+_SECTION_FLAGS = {
+    '.text': (SectionHeaderType.SHT_PROGBITS,
+              SectionHeaderFlags.SHF_ALLOC | SectionHeaderFlags.SHF_EXECINSTR),
+    '.rodata': (SectionHeaderType.SHT_PROGBITS, SectionHeaderFlags.SHF_ALLOC),
+    '.data': (SectionHeaderType.SHT_PROGBITS,
+              SectionHeaderFlags.SHF_ALLOC | SectionHeaderFlags.SHF_WRITE),
+    '.bss': (SectionHeaderType.SHT_NOBITS,
+             SectionHeaderFlags.SHF_ALLOC | SectionHeaderFlags.SHF_WRITE),
+}
+
+
+def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
+    """Write a relocatable ELF with per-segment sections for objdiff targets."""
+    # Group symbols into contiguous segment runs
+    sections = []  # (name, start, end)
+    if not sym_list:
+        sections.append(('.text', 0, len(data)))
+    else:
+        seg_name = sym_list[0].segment
+        seg_start = 0
+        for sym in sym_list:
+            if sym.segment != seg_name:
+                sections.append((seg_name, seg_start, sym.addr))
+                seg_name = sym.segment
+                seg_start = sym.addr
+        sections.append((seg_name, seg_start, len(data)))
+
+    # Build section index map: section list index -> ELF shndx (1-based)
+    sec_shndx = {}
+    for i, (name, _, _) in enumerate(sections):
+        sec_shndx[i] = i + 1  # shndx 0 is NULL
+
+    # Build symbol tables
+    local_strtab = bytearray(b'\x00')
+    global_strtab = bytearray()
+    local_syms = []
+    global_syms = []
+    sec_idx = 0
+    for sym in sym_list:
+        # Advance to the section containing this symbol
+        while sec_idx < len(sections) - 1 and sym.addr >= sections[sec_idx + 1][1]:
+            sec_idx += 1
+        _, sec_start, _ = sections[sec_idx]
+        shndx = sec_shndx[sec_idx]
+        sym_value = sym.addr - sec_start
+        thumb = 1 if sym.mode == '$t' else 0
+        local_syms.append(SymbolTableEntry(len(local_strtab), sym_value, 0, 0x0, 0x0, shndx))
+        local_strtab += sym.mode.encode('utf-8') + b'\x00'
+        global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, sym.size, 0x12, 0, shndx))
+        global_strtab += sym.name.encode('utf-8') + b'\x00'
+    for g_sym in global_syms:
+        g_sym.name_off += len(local_strtab)
+    strtab_bytes = bytes(local_strtab + global_strtab)
+
+    # Write the ELF
+    writer = BinaryWriter()
+    ELFHeader(0, 0, 0, True).write(writer)
+
+    # Section data
+    sec_offsets = []
+    for name, start, end in sections:
+        sec_offsets.append(writer.tell())
+        writer.write_bytes(data[start:end])
+        pad_to_4(writer)
+
+    # Symtab
+    symtab_off = writer.tell()
+    writer.write_bytes(b'\x00' * 0x10)  # NULL symbol
+    for st in local_syms:
+        st.write(writer)
+    for st in global_syms:
+        st.write(writer)
+
+    # Strtab
+    strtab_off = writer.tell()
+    writer.write_bytes(strtab_bytes)
+
+    # Shstrtab
+    shstrtab_off = writer.tell()
+    writer.write_u8(0)
+    sec_name_offsets = []
+    for name, _, _ in sections:
+        sec_name_offsets.append(writer.tell() - shstrtab_off)
+        writer.write_str(name)
+    symtab_name_off = writer.tell() - shstrtab_off
+    writer.write_str('.symtab')
+    strtab_name_off = writer.tell() - shstrtab_off
+    writer.write_str('.strtab')
+    shstrtab_name_off = writer.tell() - shstrtab_off
+    writer.write_str('.shstrtab')
+    pad_to_4(writer)
+
+    # Section header table
+    sh_off = writer.tell()
+    num_sections = len(sections)
+    # [0] NULL
+    SectionHeaderEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0).write(writer)
+    # [1..N] data sections
+    for i, (name, start, end) in enumerate(sections):
+        sh_type, sh_flags = _SECTION_FLAGS.get(name, (SectionHeaderType.SHT_PROGBITS,
+                                                       SectionHeaderFlags.SHF_ALLOC))
+        SectionHeaderEntry(sec_name_offsets[i], sh_type, sh_flags, 0,
+                           sec_offsets[i], end - start, 0, 0, 0, 4).write(writer)
+    # symtab: link=strtab index, info=first global
+    symtab_link = num_sections + 2  # .strtab section index
+    SectionHeaderEntry(symtab_name_off, SectionHeaderType.SHT_SYMTAB, 0, 0, symtab_off,
+                       strtab_off - symtab_off, symtab_link,
+                       len(local_syms) + 1, 0x10).write(writer)
+    # strtab
+    SectionHeaderEntry(strtab_name_off, SectionHeaderType.SHT_STRTAB, 0, 0, strtab_off,
+                       len(strtab_bytes), 0, 0, 0).write(writer)
+    # shstrtab
+    SectionHeaderEntry(shstrtab_name_off, SectionHeaderType.SHT_STRTAB, 0, 0, shstrtab_off,
+                       sh_off - shstrtab_off, 0, 0, 0, 0).write(writer)
+
+    # Patch header
+    total_sh = num_sections + 4  # NULL + data sections + symtab + strtab + shstrtab
+    writer.seek(0x20)
+    writer.write_u32(sh_off)
+    writer.seek(0x30)
+    writer.write_u16(total_sh)
+    writer.write_u16(total_sh - 1)  # shstrndx = last section
+    writer.flush(out_path)
