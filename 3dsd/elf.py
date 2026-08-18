@@ -511,11 +511,14 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
             sec_idx += 1
         _, sec_start, _ = sections[sec_idx]
         shndx = sec_shndx[sec_idx]
+        sec_name = sections[sec_idx][0]
         sym_value = sym.addr - sec_start
-        thumb = 1 if sym.mode == '$t' else 0
+        is_code = sec_name == '.text'
+        thumb = 1 if is_code and sym.mode == '$t' else 0
+        sym_type = 0x12 if is_code else 0x11  # STT_FUNC / STT_OBJECT
         local_syms.append(SymbolTableEntry(len(local_strtab), sym_value, 0, 0x0, 0x0, shndx))
         local_strtab += sym.mode.encode('utf-8') + b'\x00'
-        global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, sym.size, 0x12, 0, shndx))
+        global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, sym.size, sym_type, 0, shndx))
         global_strtab += sym.name.encode('utf-8') + b'\x00'
     for g_sym in global_syms:
         g_sym.name_off += len(local_strtab)
