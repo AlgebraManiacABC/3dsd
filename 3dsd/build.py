@@ -11,8 +11,12 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
     from .objdiff import generate_objdiff, report_progress
 
     config = ProjectConfig.load(working_dir)
-    split_dir = config.split_dir
-    needs_split = not split_dir.exists() or not any(split_dir.iterdir())
+    needs_split = False
+    for bin_name in config.binaries:
+        bin_split = config.split_dir / bin_name
+        if not bin_split.exists() or not any(bin_split.iterdir()):
+            needs_split = True
+            break
     if needs_split:
         _print("=== Split ===")
         run_split(config, progress=True)

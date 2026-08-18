@@ -102,7 +102,18 @@ class ProjectConfig:
                 flags.append(f'-I{include.as_posix()}')
         else:
             cc = self.tool_dir / cc_name
-            if not cc.exists() and not cc.with_suffix('.exe').exists():
+            if cc.is_dir():
+                install = cc
+                cc = install / 'bin' / 'armcc.exe'
+                if not cc.exists():
+                    cc = install / 'bin' / 'armcc'
+                if not cc.exists():
+                    raise Exception(
+                        f"Compiler '{cc_name}': no armcc executable in {install / 'bin'}")
+                include = install / 'include'
+                if include.is_dir():
+                    flags.append(f'-I{include.as_posix()}')
+            elif not cc.exists() and not cc.with_suffix('.exe').exists():
                 raise Exception(
                     f"Compiler '{cc_name}' not found in {self.tool_dir}.\n"
                     f"  Set its install directory in cc.yaml, e.g.:\n"

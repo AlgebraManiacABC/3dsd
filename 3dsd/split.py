@@ -74,8 +74,12 @@ def split_binary(binary: CTRBinary, split_dir: Path,
 def run_split(config: ProjectConfig, progress: bool = True):
     """Split all binaries in the project."""
     for name in config.binaries:
-        print(f"Splitting {name}...")
         split_dir = config.split_dir / name
+        if split_dir.exists() and any(split_dir.iterdir()):
+            if progress:
+                print(f"  {name}: already split, skipping")
+            continue
+        print(f"Splitting {name}...")
         split_dir.mkdir(parents=True, exist_ok=True)
         symbols = config.symbols.get(name, [])
         split_binary(config.binaries[name], split_dir, symbols, progress)
