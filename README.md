@@ -7,6 +7,8 @@ results byte-for-byte (relocation-aware), and reports progress. The rebuilt
 binary is **always byte-perfect** — unmatched or in-progress code falls back to
 the original bytes automatically.
 
+ALL work done in Claude Code using Opus 4.6 and Fable 5 models.
+
 ## Requirements
 
 - Python 3.10+ with `pip install pyyaml ninja`
