@@ -56,10 +56,11 @@ def generate_objdiff(config: ProjectConfig):
     units = []
     for name in config.binaries:
         target_path = _rel(config.out_dir / 'objdiff_target' / name, config.working_dir)
+        base_path = _rel(config.out_dir / 'objdiff_base' / name, config.working_dir)
         unit = {
             "name": name,
             "target_path": _posix(target_path),
-            "base_path": None,
+            "base_path": _posix(base_path),
             "metadata": {
                 "progress_categories": [name],
             },
