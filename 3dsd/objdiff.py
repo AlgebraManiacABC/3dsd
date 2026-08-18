@@ -46,23 +46,17 @@ def generate_objdiff(config: ProjectConfig):
             unit = {
                 "name": f'{name}/{sym_name}',
                 "target_path": _posix(split_path),
+                "base_path": None,
+                "metadata": {
+                    "progress_categories": [name],
+                },
             }
 
             if has_source:
                 src_path, stem = source_map[sym_name]
                 build_path = _rel(config.build_dir / name / f'{stem}.o', config.working_dir)
                 unit["base_path"] = _posix(build_path)
-                unit["metadata"] = {
-                    "progress_categories": [name],
-                    "complete": None,
-                    "source_path": _posix(_rel(src_path, config.working_dir)),
-                }
-            else:
-                unit["metadata"] = {
-                    "progress_categories": [name],
-                    "complete": False,
-                    "auto_generated": True,
-                }
+                unit["metadata"]["source_path"] = _posix(_rel(src_path, config.working_dir))
 
             units.append(unit)
 
@@ -85,6 +79,14 @@ def generate_objdiff(config: ProjectConfig):
 
 def report_progress(config: ProjectConfig):
     """Report exact and in-progress (fuzzy) match state per binary."""
+    grand_total_bytes = 0
+    grand_matching_bytes = 0
+    grand_fuzzy_bytes = 0.0
+    grand_total_funcs = 0
+    grand_matching_funcs = 0
+    grand_decompiled = 0
+    grand_in_progress = []
+
     for name in config.binaries:
         symbols = config.symbols.get(name, [])
         source_map = config.get_source_map(name)
@@ -96,7 +98,7 @@ def report_progress(config: ProjectConfig):
         matching_bytes = 0
         fuzzy_bytes = 0.0
         matching_funcs = 0
-        in_progress = []  # fuzzy ratios of covered-but-not-exact functions
+        in_progress = []
         total_funcs = 0
         decompiled_funcs = 0
 
@@ -160,6 +162,27 @@ def report_progress(config: ProjectConfig):
             avg = sum(in_progress) / len(in_progress) * 100
             line += (f"\n{indent}fuzzy: {int(fuzzy_bytes):,} bytes ({fuzzy_pct:.4f}%),"
                      f" {len(in_progress)} in progress (avg {avg:.1f}%)")
+        print(line)
+
+        grand_total_bytes += total_bytes
+        grand_matching_bytes += matching_bytes
+        grand_fuzzy_bytes += fuzzy_bytes
+        grand_total_funcs += total_funcs
+        grand_matching_funcs += matching_funcs
+        grand_decompiled += decompiled_funcs
+        grand_in_progress.extend(in_progress)
+
+    if len(config.binaries) > 1:
+        pct = (grand_matching_bytes / grand_total_bytes * 100) if grand_total_bytes else 0
+        fuzzy_pct = (grand_fuzzy_bytes / grand_total_bytes * 100) if grand_total_bytes else 0
+        func_pct = (grand_matching_funcs / grand_total_funcs * 100) if grand_total_funcs else 0
+        line = (f"  Total: {grand_matching_bytes:,} / {grand_total_bytes:,} bytes ({pct:.4f}%)"
+                f"\n         functions: {grand_matching_funcs:,} / {grand_total_funcs:,} ({func_pct:.2f}%),"
+                f" {grand_decompiled:,} with source")
+        if grand_in_progress:
+            avg = sum(grand_in_progress) / len(grand_in_progress) * 100
+            line += (f"\n         fuzzy: {int(grand_fuzzy_bytes):,} bytes ({fuzzy_pct:.4f}%),"
+                     f" {len(grand_in_progress)} in progress (avg {avg:.1f}%)")
         print(line)
 
     _report_objdiff_cli(config)
