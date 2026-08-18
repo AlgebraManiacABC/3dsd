@@ -109,11 +109,16 @@ def report_progress(config: ProjectConfig):
         total_funcs = int(measures.get('total_functions', 0))
         matched_funcs = int(measures.get('matched_functions', 0))
         func_pct = (matched_funcs / total_funcs * 100) if total_funcs else 0
+        total_data = int(measures.get('total_data', 0))
+        matched_data = int(measures.get('matched_data', 0))
+        data_pct = float(measures.get('matched_data_percent', 0.0))
         indent = ' ' * (4 + len(label))
         line = f"  {label}: {matched:,} / {total:,} bytes ({matched_pct:.4f}%)"
         line += f"\n{indent}functions: {matched_funcs:,} / {total_funcs:,} ({func_pct:.2f}%)"
         if fuzzy_pct > matched_pct:
             line += f"\n{indent}fuzzy: {fuzzy_pct:.4f}%"
+        if total_data:
+            line += f"\n{indent}data: {matched_data:,} / {total_data:,} bytes ({data_pct:.4f}%)"
         print(line)
 
     units = report.get('units', [])
