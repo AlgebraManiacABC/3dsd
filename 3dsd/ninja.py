@@ -214,6 +214,8 @@ def generate_ninja(config: ProjectConfig):
             lines.append('')
 
         default_targets.append(final_bin)
+        if compiled_objects:
+            default_targets.append(base_elf)
 
     # Phony targets
     if compare_targets:

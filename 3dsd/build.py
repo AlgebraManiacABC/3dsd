@@ -16,7 +16,6 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
 
     _print("=== Ninja ===")
     generate_ninja(config)
-    generate_objdiff(config)
 
     try:
         from ninja import BIN_DIR
@@ -35,6 +34,9 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
         cmd += targets
 
     result = subprocess.run(cmd)
+
+    _print("=== Objdiff ===")
+    generate_objdiff(config)
 
     _print("=== Progress ===")
     report_progress(config)
