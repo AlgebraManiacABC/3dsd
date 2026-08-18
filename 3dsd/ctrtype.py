@@ -1,7 +1,12 @@
 import hashlib
 from enum import IntEnum
 from typing import TypeVar, Generic
-from typing_extensions import override
+
+try:
+    from typing import override  # Python 3.12+
+except ImportError:
+    def override(func):  # static-checking decorator only; no-op at runtime
+        return func
 
 from .util import (
     BinaryReader, BinaryWriter, Writable, WritableStr, WritableBytes, RelocationType,
