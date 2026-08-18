@@ -1,0 +1,223 @@
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+from .config import ProjectConfig
+from .elf import ELF
+from .util import sanitize
+
+
+def generate_objdiff(config: ProjectConfig):
+    """Generate objdiff.json for decomp progress tracking."""
+    units = []
+
+    for name in config.binaries:
+        symbols = config.symbols.get(name, [])
+        source_map = config.get_source_map(name)
+        sym_dict = {sym.addr: sym for sym in symbols if sym.addr >= 0}
+        addrs = sorted(sym_dict.keys())
+        bin_size = len(config.binaries[name].data)
+
+        cur = 0
+        addr_idx = 0
+
+        while addr_idx < len(addrs) or cur < bin_size:
+            if addr_idx >= len(addrs):
+                sym_name = f'{cur:08x}'
+                sym_size = bin_size - cur
+                cur += sym_size
+            elif cur == addrs[addr_idx]:
+                sym = sym_dict[cur]
+                sym_name = sanitize(sym.name)
+                next_addr = addrs[addr_idx + 1] if addr_idx + 1 < len(addrs) else bin_size
+                sym_size = min(sym.size, next_addr - cur)
+                cur += sym_size
+                addr_idx += 1
+            elif cur < addrs[addr_idx]:
+                sym_name = f'{cur:08x}'
+                cur = addrs[addr_idx]
+            else:
+                raise RuntimeError(f"Address tracking error at {cur:08x}")
+
+            split_path = _rel(config.split_dir / name / f'{sym_name}.o', config.working_dir)
+            has_source = sym_name in source_map
+
+            unit = {
+                "name": f'{name}/{sym_name}',
+                "target_path": _posix(split_path),
+            }
+
+            if has_source:
+                src_path, stem = source_map[sym_name]
+                build_path = _rel(config.build_dir / name / f'{stem}.o', config.working_dir)
+                unit["base_path"] = _posix(build_path)
+                unit["metadata"] = {
+                    "progress_categories": [name],
+                    "complete": None,
+                    "source_path": _posix(_rel(src_path, config.working_dir)),
+                }
+            else:
+                unit["metadata"] = {
+                    "progress_categories": [name],
+                    "complete": False,
+                    "auto_generated": True,
+                }
+
+            units.append(unit)
+
+    objdiff = {
+        "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
+        "custom_make": "ninja",
+        "build_target": False,
+        "build_base": True,
+        "watch_patterns": [
+            "*.c", "*.cpp", "*.h", "*.s", "*.S",
+            "cc.yaml", "build.ninja",
+        ],
+        "units": units,
+        "progress_categories": [{"id": n, "name": n} for n in config.binaries],
+    }
+    out_path = config.working_dir / 'objdiff.json'
+    out_path.write_text(json.dumps(objdiff, indent=2))
+    print(f"Generated {out_path}")
+
+
+def report_progress(config: ProjectConfig):
+    """Report exact and in-progress (fuzzy) match state per binary."""
+    for name in config.binaries:
+        symbols = config.symbols.get(name, [])
+        source_map = config.get_source_map(name)
+        sym_dict = {sym.addr: sym for sym in symbols if sym.addr >= 0}
+        addrs = sorted(sym_dict.keys())
+        bin_size = len(config.binaries[name].data)
+
+        total_bytes = bin_size
+        matching_bytes = 0
+        fuzzy_bytes = 0.0
+        matching_funcs = 0
+        in_progress = []  # fuzzy ratios of covered-but-not-exact functions
+        total_funcs = 0
+        decompiled_funcs = 0
+
+        cur = 0
+        addr_idx = 0
+
+        while addr_idx < len(addrs) or cur < bin_size:
+            if addr_idx >= len(addrs):
+                sym_name = f'{cur:08x}'
+                real_name = sym_name
+                sym_size = bin_size - cur
+                cur += sym_size
+                is_symbol = False
+            elif cur == addrs[addr_idx]:
+                sym = sym_dict[cur]
+                sym_name = sanitize(sym.name)
+                real_name = sym.name
+                next_addr = addrs[addr_idx + 1] if addr_idx + 1 < len(addrs) else bin_size
+                sym_size = min(sym.size, next_addr - cur)
+                cur += sym_size
+                addr_idx += 1
+                is_symbol = True
+            elif cur < addrs[addr_idx]:
+                sym_name = f'{cur:08x}'
+                real_name = sym_name
+                sym_size = addrs[addr_idx] - cur
+                cur = addrs[addr_idx]
+                is_symbol = False
+            else:
+                raise RuntimeError(f"Address tracking error at {cur:08x}")
+
+            if is_symbol:
+                total_funcs += 1
+            if sym_name not in source_map:
+                continue
+
+            decompiled_funcs += 1
+            match_stamp = config.link_dir / name / f'{sym_name}.o.match'
+
+            if match_stamp.exists():
+                matching_bytes += sym_size
+                fuzzy_bytes += sym_size
+                matching_funcs += 1
+                continue
+
+            _, stem = source_map[sym_name]
+            ratio = _fuzzy_ratio(config.build_dir / name / f'{stem}.o',
+                                 config.split_dir / name / f'{sym_name}.o',
+                                 real_name, sym_name)
+            in_progress.append(ratio)
+            fuzzy_bytes += sym_size * ratio
+
+        pct = (matching_bytes / total_bytes * 100) if total_bytes else 0
+        fuzzy_pct = (fuzzy_bytes / total_bytes * 100) if total_bytes else 0
+        func_pct = (matching_funcs / total_funcs * 100) if total_funcs else 0
+        indent = ' ' * (4 + len(name))
+        line = (f"  {name}: {matching_bytes:,} / {total_bytes:,} bytes ({pct:.4f}%)"
+                f"\n{indent}functions: {matching_funcs:,} / {total_funcs:,} ({func_pct:.2f}%),"
+                f" {decompiled_funcs:,} with source")
+        if in_progress:
+            avg = sum(in_progress) / len(in_progress) * 100
+            line += (f"\n{indent}fuzzy: {int(fuzzy_bytes):,} bytes ({fuzzy_pct:.4f}%),"
+                     f" {len(in_progress)} in progress (avg {avg:.1f}%)")
+        print(line)
+
+    _report_objdiff_cli(config)
+
+
+def _fuzzy_ratio(build_o: Path, split_o: Path, real_name: str, sym_name: str) -> float:
+    """Fraction of a function's bytes matching the original, reloc sites masked."""
+    if not build_o.exists() or build_o.stat().st_size == 0 or not split_o.exists():
+        return 0.0
+    compiled = ELF.from_section(build_o, real_name)
+    if compiled is None and real_name != sym_name:
+        compiled = ELF.from_section(build_o, sym_name)
+    if compiled is None:
+        return 0.0
+    split = ELF.from_path(split_o)
+    n = min(len(compiled.data), len(split.data))
+    denom = max(len(split.data), 1)
+    matched = 0
+    for i in range(n):
+        m = compiled.mask.mask[i] & split.mask.mask[i]
+        if (compiled.data[i] & m) == (split.data[i] & m):
+            matched += 1
+    return matched / denom
+
+
+def _report_objdiff_cli(config: ProjectConfig):
+    """If objdiff-cli is installed, also emit its CI-standard report."""
+    cli = shutil.which('objdiff-cli')
+    if not cli:
+        return
+    result = subprocess.run([cli, 'report', 'generate'],
+                            cwd=config.working_dir, capture_output=True, text=True)
+    if result.returncode != 0 or not result.stdout.strip():
+        print(f"  (objdiff-cli report failed: {result.stderr.strip().splitlines()[-1] if result.stderr.strip() else 'no output'})")
+        return
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("  (objdiff-cli produced unparseable output)")
+        return
+    measures = data.get('measures', data)
+    fuzzy = measures.get('fuzzy_match_percent')
+    matched = measures.get('matched_code_percent')
+    if fuzzy is not None or matched is not None:
+        parts = []
+        if matched is not None:
+            parts.append(f"matched {matched:.2f}%")
+        if fuzzy is not None:
+            parts.append(f"fuzzy {fuzzy:.2f}%")
+        print(f"  objdiff-cli: {', '.join(parts)}")
+
+
+def _rel(path: Path, base: Path) -> Path:
+    try:
+        return path.relative_to(base)
+    except ValueError:
+        return path
+
+
+def _posix(p) -> str:
+    return str(p).replace('\\', '/')

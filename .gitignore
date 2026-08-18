@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+build/
+split/
+link/
+out/
+build.ninja
+.ninja_log
+.ninja_deps
+objdiff.json
+*.egg-info/
+dist/
+.claude/

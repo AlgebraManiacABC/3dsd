@@ -1,0 +1,13 @@
+[project]
+name = "3dsd-pipeline"
+version = "0.1.0"
+description = "3DS decompilation pipeline with Ninja build integration"
+requires-python = ">=3.10"
+dependencies = [
+    "pyyaml",
+    "ninja",
+]
+
+# No [project.scripts] entry: '3dsd' is not a valid Python identifier, so
+# pip-generated console scripts (which emit a literal import statement)
+# would be broken. Invoke the tool as: python -m 3dsd <command>
