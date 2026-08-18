@@ -5,7 +5,35 @@ from pathlib import Path
 
 from .config import ProjectConfig
 from .elf import ELF
-from .util import sanitize
+from .util import Symbol, sanitize
+
+
+def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
+    """Return a symbol list covering every byte, filling gaps with synthetics."""
+    sym_dict = {sym.addr: sym for sym in symbols if 0 <= sym.addr < bin_size}
+    addrs = sorted(sym_dict.keys())
+    result = []
+    cur = 0
+    idx = 0
+
+    while idx < len(addrs) or cur < bin_size:
+        if idx >= len(addrs):
+            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', bin_size - cur, '.text'))
+            break
+        elif cur == addrs[idx]:
+            sym = sym_dict[cur]
+            next_addr = addrs[idx + 1] if idx + 1 < len(addrs) else bin_size
+            size = min(sym.size, next_addr - cur)
+            result.append(Symbol(cur, sym.name, sym.mode, size, sym.segment))
+            cur += size
+            idx += 1
+        elif cur < addrs[idx]:
+            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', addrs[idx] - cur, '.text'))
+            cur = addrs[idx]
+        else:
+            raise RuntimeError(f"Address tracking error at {cur:08x}")
+
+    return result
 
 
 def generate_target_elfs(config: ProjectConfig):
@@ -14,7 +42,7 @@ def generate_target_elfs(config: ProjectConfig):
     target_dir.mkdir(parents=True, exist_ok=True)
     for name in config.binaries:
         data = config.binaries[name].data
-        syms = config.symbols.get(name, [])
+        syms = _complete_symbols(config.symbols.get(name, []), len(data))
         elf = ELF.from_bytes_multi(data, 0, syms)
         out = target_dir / name
         elf.write(out)
