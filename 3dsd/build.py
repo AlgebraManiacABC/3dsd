@@ -11,15 +11,8 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
     from .objdiff import generate_objdiff, report_progress
 
     config = ProjectConfig.load(working_dir)
-    needs_split = False
-    for bin_name in config.binaries:
-        bin_split = config.split_dir / bin_name
-        if not bin_split.exists() or not any(bin_split.iterdir()):
-            needs_split = True
-            break
-    if needs_split:
-        _print("=== Split ===")
-        run_split(config, progress=True)
+    _print("=== Split ===")
+    run_split(config, progress=True)
 
     _print("=== Ninja ===")
     generate_ninja(config)

@@ -17,6 +17,14 @@ def generate_ninja(config: ProjectConfig):
     """Generate build.ninja for the project."""
     ninja_path = config.working_dir / 'build.ninja'
     linker_ld = Path(__file__).parent / 'linker.ld'
+    wd = config.working_dir
+
+    def _rel(p: Path) -> str:
+        """Make a path relative to working_dir for the ninja file."""
+        try:
+            return _posix(p.relative_to(wd))
+        except ValueError:
+            return _posix(p)
 
     ld = _posix(config.ld_path().resolve())
     objcopy = _posix(config.objcopy_path().resolve())
@@ -87,8 +95,7 @@ def generate_ninja(config: ProjectConfig):
         bin_size = len(binary.data)
         base_addr = binary.base_addr
 
-        sym_csv = config.working_dir / 'symbols' / f'{bin_name}.csv'
-        sym_csv_posix = _posix(sym_csv)
+        sym_csv_posix = _rel(config.working_dir / 'symbols' / f'{bin_name}.csv')
 
         emitted_compile: set[str] = set()
 
@@ -120,12 +127,12 @@ def generate_ninja(config: ProjectConfig):
             else:
                 raise RuntimeError(f"Address tracking error at {cur_addr:08x}")
 
-            split_o = _posix(config.split_dir / bin_name / f'{sym_name}.o')
+            split_o = _rel(config.split_dir / bin_name / f'{sym_name}.o')
 
             if sym_name in source_map:
                 src_path, stem = source_map[sym_name]
-                build_o = _posix(config.build_dir / bin_name / f'{stem}.o')
-                link_o = _posix(config.link_dir / bin_name / f'{sym_name}.o')
+                build_o = _rel(config.build_dir / bin_name / f'{stem}.o')
+                link_o = _rel(config.link_dir / bin_name / f'{sym_name}.o')
 
                 if stem not in emitted_compile:
                     emitted_compile.add(stem)
@@ -133,7 +140,7 @@ def generate_ninja(config: ProjectConfig):
                     cc_posix = _posix(cc_path.resolve())
                     flags_arg = '--flags=' + ','.join(flags) if flags else ''
 
-                    lines.append(f'build {_escape_ninja(build_o)}: compile {_escape_ninja(_posix(src_path))}')
+                    lines.append(f'build {_escape_ninja(build_o)}: compile {_escape_ninja(_rel(src_path))}')
                     lines.append(f'  cc_path = {cc_posix}')
                     lines.append(f'  flags_arg = {flags_arg}')
                     lines.append(f'  desc = {bin_name}/{stem}')
@@ -154,7 +161,7 @@ def generate_ninja(config: ProjectConfig):
                 link_objects.append(split_o)
 
         # Link all objects
-        linked = _posix(config.out_dir / f'{bin_name}_linked')
+        linked = _rel(config.out_dir / f'{bin_name}_linked')
         obj_list = ' '.join(_escape_ninja(o) for o in link_objects)
         lines.append(f'build {_escape_ninja(linked)}: link {obj_list}')
         lines.append(f'  ldflags = {ld_flags}')
@@ -163,9 +170,9 @@ def generate_ninja(config: ProjectConfig):
         # Convert to binary
         is_cro = '.cro' in bin_name
         if is_cro:
-            temp_bin = _posix(config.out_dir / f'{bin_name}.temp')
-            final_bin = _posix(config.out_dir / bin_name)
-            orig_bin = _posix(next(p for p in config.originals if p.name == bin_name))
+            temp_bin = _rel(config.out_dir / f'{bin_name}.temp')
+            final_bin = _rel(config.out_dir / bin_name)
+            orig_bin = _rel(next(p for p in config.originals if p.name == bin_name))
 
             lines.append(f'build {_escape_ninja(temp_bin)}: to_binary {_escape_ninja(linked)}')
             lines.append('')
@@ -174,16 +181,16 @@ def generate_ninja(config: ProjectConfig):
             lines.append(f'  original = {orig_bin}')
             lines.append('')
         else:
-            final_bin = _posix(config.out_dir / bin_name)
+            final_bin = _rel(config.out_dir / bin_name)
             lines.append(f'build {_escape_ninja(final_bin)}: to_binary {_escape_ninja(linked)}')
             lines.append('')
 
         # Verify
         orig_file = next((p for p in config.originals if p.name == bin_name), None)
         if orig_file:
-            stamp = _posix(config.out_dir / f'{bin_name}.verified')
+            stamp = _rel(config.out_dir / f'{bin_name}.verified')
             lines.append(f'build {_escape_ninja(stamp)}: verify {_escape_ninja(final_bin)}')
-            lines.append(f'  original = {_posix(orig_file)}')
+            lines.append(f'  original = {_rel(orig_file)}')
             lines.append(f'  desc = {bin_name}')
             lines.append('')
 
