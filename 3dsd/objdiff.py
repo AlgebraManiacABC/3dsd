@@ -8,67 +8,40 @@ from .elf import ELF
 from .util import sanitize
 
 
+def generate_target_elfs(config: ProjectConfig):
+    """Wrap each original binary as an ELF with symbols from the CSV."""
+    target_dir = config.out_dir / 'objdiff_target'
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for name in config.binaries:
+        data = config.binaries[name].data
+        syms = config.symbols.get(name, [])
+        elf = ELF.from_bytes_multi(data, 0, syms)
+        out = target_dir / name
+        elf.write(out)
+        print(f"  {name}: {len(data):,} bytes, {len(syms)} symbols -> {out}")
+
+
 def generate_objdiff(config: ProjectConfig):
     """Generate objdiff.json for decomp progress tracking."""
+    generate_target_elfs(config)
+
     units = []
-
     for name in config.binaries:
-        symbols = config.symbols.get(name, [])
-        source_map = config.get_source_map(name)
-        sym_dict = {sym.addr: sym for sym in symbols if sym.addr >= 0}
-        addrs = sorted(sym_dict.keys())
-        bin_size = len(config.binaries[name].data)
-
-        cur = 0
-        addr_idx = 0
-
-        while addr_idx < len(addrs) or cur < bin_size:
-            if addr_idx >= len(addrs):
-                sym_name = f'{cur:08x}'
-                sym_size = bin_size - cur
-                cur += sym_size
-            elif cur == addrs[addr_idx]:
-                sym = sym_dict[cur]
-                sym_name = sanitize(sym.name)
-                next_addr = addrs[addr_idx + 1] if addr_idx + 1 < len(addrs) else bin_size
-                sym_size = min(sym.size, next_addr - cur)
-                cur += sym_size
-                addr_idx += 1
-            elif cur < addrs[addr_idx]:
-                sym_name = f'{cur:08x}'
-                cur = addrs[addr_idx]
-            else:
-                raise RuntimeError(f"Address tracking error at {cur:08x}")
-
-            split_path = _rel(config.split_dir / name / f'{sym_name}.o', config.working_dir)
-            has_source = sym_name in source_map
-
-            unit = {
-                "name": f'{name}/{sym_name}',
-                "target_path": _posix(split_path),
-                "base_path": None,
-                "metadata": {
-                    "progress_categories": [name],
-                },
-            }
-
-            if has_source:
-                src_path, stem = source_map[sym_name]
-                build_path = _rel(config.build_dir / name / f'{stem}.o', config.working_dir)
-                unit["base_path"] = _posix(build_path)
-                unit["metadata"]["source_path"] = _posix(_rel(src_path, config.working_dir))
-
-            units.append(unit)
+        target_path = _rel(config.out_dir / 'objdiff_target' / name, config.working_dir)
+        unit = {
+            "name": name,
+            "target_path": _posix(target_path),
+            "base_path": None,
+            "metadata": {
+                "progress_categories": [name],
+            },
+        }
+        units.append(unit)
 
     objdiff = {
         "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
-        "custom_make": "ninja",
         "build_target": False,
-        "build_base": True,
-        "watch_patterns": [
-            "*.c", "*.cpp", "*.h", "*.s", "*.S",
-            "cc.yaml", "build.ninja",
-        ],
+        "build_base": False,
         "units": units,
         "progress_categories": [{"id": n, "name": n} for n in config.binaries],
     }
