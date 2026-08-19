@@ -12,5 +12,5 @@ dependencies = [
 # pip-generated console scripts (which emit a literal import statement)
 # would be broken. Invoke the tool as: python -m 3dsd <command>
 
-[tool.setuptools]
-packages = ["3dsd"]
+[tool.setuptools.packages.find]
+include = ["3dsd"]
