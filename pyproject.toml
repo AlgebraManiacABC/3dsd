@@ -11,3 +11,6 @@ dependencies = [
 # No [project.scripts] entry: '3dsd' is not a valid Python identifier, so
 # pip-generated console scripts (which emit a literal import statement)
 # would be broken. Invoke the tool as: python -m 3dsd <command>
+
+[tool.setuptools]
+packages = ["3dsd"]
