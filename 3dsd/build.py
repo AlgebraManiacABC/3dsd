@@ -1,6 +1,16 @@
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+
+def _find_ninja() -> str | None:
+    try:
+        from ninja import BIN_DIR
+        return str(Path(BIN_DIR) / 'ninja')
+    except ImportError:
+        pass
+    return shutil.which('ninja')
 
 
 def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
@@ -17,11 +27,9 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
     _print("=== Ninja ===")
     generate_ninja(config)
 
-    try:
-        from ninja import BIN_DIR
-        ninja_bin = str(Path(BIN_DIR) / 'ninja')
-    except ImportError:
-        _print("Error: ninja package not installed. Run: pip install ninja")
+    ninja_bin = _find_ninja()
+    if not ninja_bin:
+        _print("Error: ninja not found. Install it via pip (pip install ninja) or your system package manager.")
         return False
 
     _print("=== Build ===")
