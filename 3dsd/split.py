@@ -1,6 +1,7 @@
+import hashlib
 from pathlib import Path
 
-from .config import ProjectConfig
+from .config import ProjectConfig, SYMBOLS_DIR
 from .ctrtype import CTRBinary
 from .elf import ELF
 from .util import Symbol, sanitize
@@ -71,21 +72,36 @@ def split_binary(binary: CTRBinary, split_dir: Path,
     return splat
 
 
+def _split_key(binary: CTRBinary, csv_file: Path) -> str:
+    """Content hash of every input the split output depends on.
+
+    Hashing rather than comparing mtimes: a CSV copied in from elsewhere keeps
+    its original timestamp and can be older than the stamp while having
+    completely different contents.
+    """
+    h = hashlib.sha256()
+    h.update(binary.data)
+    if csv_file.exists():
+        h.update(csv_file.read_bytes())
+    return h.hexdigest()
+
+
 def run_split(config: ProjectConfig, progress: bool = True):
     """Split all binaries in the project."""
-    sym_dir = config.working_dir / 'symbols'
+    sym_dir = config.working_dir / SYMBOLS_DIR
     for name in config.binaries:
         split_dir = config.split_dir / name
         split_dir.mkdir(parents=True, exist_ok=True)
         stamp = split_dir / '.split_stamp'
-        csv_file = sym_dir / f'{name}.csv'
-        if stamp.exists() and csv_file.exists():
-            if stamp.stat().st_mtime >= csv_file.stat().st_mtime:
-                if progress:
-                    print(f"  {name}: up to date")
-                continue
+        key = _split_key(config.binaries[name], sym_dir / f'{name}.csv')
+
+        if stamp.exists() and stamp.read_text().strip() == key:
+            if progress:
+                print(f"  {name}: up to date")
+            continue
+
         print(f"Splitting {name}...")
         symbols = config.symbols.get(name, [])
         split_binary(config.binaries[name], split_dir, symbols, progress)
-        stamp.write_bytes(b'')
+        stamp.write_text(key)
     print("Split complete.")

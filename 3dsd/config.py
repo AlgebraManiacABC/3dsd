@@ -15,6 +15,7 @@ BUILD_DIR = 'build'
 SPLIT_DIR = 'split'
 LINK_DIR = 'link'
 OUT_DIR = 'out'
+SYMBOLS_DIR = 'symbols'
 
 
 class ProjectConfig:
@@ -52,7 +53,7 @@ class ProjectConfig:
         link_dir = working_dir / LINK_DIR
         out_dir = working_dir / OUT_DIR
         tool_dir = working_dir / 'tools'
-        sym_dir = working_dir / 'symbols'
+        sym_dir = working_dir / SYMBOLS_DIR
         cc_path = working_dir / 'cc.yaml'
 
         _check_dirs(working_dir, orig_dir, tool_dir, sym_dir, cc_path)
