@@ -73,10 +73,19 @@ def split_binary(binary: CTRBinary, split_dir: Path,
 
 def run_split(config: ProjectConfig, progress: bool = True):
     """Split all binaries in the project."""
+    sym_dir = config.working_dir / 'symbols'
     for name in config.binaries:
-        print(f"Splitting {name}...")
         split_dir = config.split_dir / name
         split_dir.mkdir(parents=True, exist_ok=True)
+        stamp = split_dir / '.split_stamp'
+        csv_file = sym_dir / f'{name}.csv'
+        if stamp.exists() and csv_file.exists():
+            if stamp.stat().st_mtime >= csv_file.stat().st_mtime:
+                if progress:
+                    print(f"  {name}: up to date")
+                continue
+        print(f"Splitting {name}...")
         symbols = config.symbols.get(name, [])
         split_binary(config.binaries[name], split_dir, symbols, progress)
+        stamp.write_bytes(b'')
     print("Split complete.")
