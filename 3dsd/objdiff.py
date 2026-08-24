@@ -80,6 +80,38 @@ def generate_objdiff(config: ProjectConfig):
     print(f"Generated {out_path}")
 
 
+def format_measures(measures: dict, label: str) -> str:
+    """Render one objdiff measures block as a progress report entry."""
+    total = int(measures.get('total_code', 0))
+    matched = int(measures.get('matched_code', 0))
+    matched_pct = float(measures.get('matched_code_percent', 0.0))
+    fuzzy_pct = float(measures.get('fuzzy_match_percent', 0.0))
+    total_funcs = int(measures.get('total_functions', 0))
+    matched_funcs = int(measures.get('matched_functions', 0))
+    func_pct = (matched_funcs / total_funcs * 100) if total_funcs else 0
+    total_data = int(measures.get('total_data', 0))
+
+    indent = ' ' * (4 + len(label))
+    line = f"  {label}: {matched:,} / {total:,} bytes ({matched_pct:.4f}%)"
+    line += f"\n{indent}functions: {matched_funcs:,} / {total_funcs:,} ({func_pct:.2f}%)"
+    if fuzzy_pct > matched_pct:
+        line += f"\n{indent}fuzzy: {fuzzy_pct:.4f}%"
+    if total_data:
+        # objdiff only emits matched_data when it actually measured the data
+        # sections; report the size alone rather than a synthetic zero.
+        if 'matched_data' in measures:
+            matched_data = int(measures['matched_data'])
+            if 'matched_data_percent' in measures:
+                data_pct = float(measures['matched_data_percent'])
+            else:
+                data_pct = matched_data / total_data * 100
+            line += (f"\n{indent}data: {matched_data:,} / {total_data:,} "
+                     f"bytes ({data_pct:.4f}%)")
+        else:
+            line += f"\n{indent}data: {total_data:,} bytes (not tracked)"
+    return line
+
+
 def report_progress(config: ProjectConfig):
     """Report decomp progress using objdiff-cli."""
     cli = shutil.which('objdiff-cli')
@@ -101,38 +133,26 @@ def report_progress(config: ProjectConfig):
         print(f"  objdiff-cli failed: {msg}")
         return
 
+    # Persist the full report before parsing: only a few summary fields are
+    # printed, and the per-symbol detail is useful for inspection and diffing.
+    # Written verbatim so it matches what objdiff-cli produces elsewhere (CI).
+    report_path = config.out_dir / 'report.json'
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(result.stdout)
+    print(f"  Full report: {report_path}")
+
     try:
         report = json.loads(result.stdout)
     except json.JSONDecodeError:
         print("  objdiff-cli produced unparseable output")
         return
 
-    def _fmt(measures: dict, label: str):
-        total = int(measures.get('total_code', 0))
-        matched = int(measures.get('matched_code', 0))
-        matched_pct = float(measures.get('matched_code_percent', 0.0))
-        fuzzy_pct = float(measures.get('fuzzy_match_percent', 0.0))
-        total_funcs = int(measures.get('total_functions', 0))
-        matched_funcs = int(measures.get('matched_functions', 0))
-        func_pct = (matched_funcs / total_funcs * 100) if total_funcs else 0
-        total_data = int(measures.get('total_data', 0))
-        matched_data = int(measures.get('matched_data', 0))
-        data_pct = float(measures.get('matched_data_percent', 0.0))
-        indent = ' ' * (4 + len(label))
-        line = f"  {label}: {matched:,} / {total:,} bytes ({matched_pct:.4f}%)"
-        line += f"\n{indent}functions: {matched_funcs:,} / {total_funcs:,} ({func_pct:.2f}%)"
-        if fuzzy_pct > matched_pct:
-            line += f"\n{indent}fuzzy: {fuzzy_pct:.4f}%"
-        if total_data:
-            line += f"\n{indent}data: {matched_data:,} / {total_data:,} bytes ({data_pct:.4f}%)"
-        print(line)
-
     units = report.get('units', [])
     for unit in units:
-        _fmt(unit.get('measures', {}), unit.get('name', '?'))
+        print(format_measures(unit.get('measures', {}), unit.get('name', '?')))
 
     if len(units) > 1:
-        _fmt(report.get('measures', {}), 'Total')
+        print(format_measures(report.get('measures', {}), 'Total'))
 
 
 def _rel(path: Path, base: Path) -> Path:

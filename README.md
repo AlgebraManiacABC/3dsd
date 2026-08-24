@@ -182,13 +182,20 @@ Because `clean` removes `build.ninja`, run `python -m 3dsd ninja .` (or any
 code.bin: 27,964 / 495,616 bytes (5.6423%)          ← exact-matched bytes (primary)
           functions: 83 / 1,571 (5.28%)
           fuzzy: 6.9830%
-          data: 1,204 / 50,132 bytes (2.4016%)
+          data: 1,324,588 bytes (not tracked)
 ```
 
 Byte percentages are measured against the whole binary. *Fuzzy* adds partial
 credit for in-progress functions (masked byte ratio) and is printed only when
-it exceeds the exact figure; *data* is printed only when the binary has data
-symbols. With more than one binary a `Total` line is appended.
+it exceeds the exact figure. With more than one binary a `Total` line is
+appended.
+
+The *data* line reports only the size when objdiff returns no `matched_data`
+figure, which is the normal case for whole-binary units: objdiff matches data
+at the section level, and a unit spanning the entire binary gives it nothing
+to compare. If objdiff does report matched data, the line shows the full
+`matched / total (percent)` form instead. Code matching is unaffected — it is
+symbol-based and works regardless.
 
 Progress is computed by `objdiff-cli`, which is looked up on `PATH` and then in
 the project's `tools/` directory; without it the rest of the build still runs.
