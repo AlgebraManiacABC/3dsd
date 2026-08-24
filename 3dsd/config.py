@@ -9,6 +9,13 @@ import yaml
 from .ctrtype import CTRBinary, CRO, ExHeader
 from .util import BinaryReader, Symbol, sanitize
 
+# Generated directory names, relative to the project working directory.
+# Shared with clean.py so the two cannot drift apart.
+BUILD_DIR = 'build'
+SPLIT_DIR = 'split'
+LINK_DIR = 'link'
+OUT_DIR = 'out'
+
 
 class ProjectConfig:
     """Loaded project state: binaries, symbols, sources, compiler config, paths."""
@@ -40,10 +47,10 @@ class ProjectConfig:
     def load(cls, working_dir: Path, single_binary: str = None) -> "ProjectConfig":
         orig_dir = working_dir / 'orig'
         source_dir = working_dir / 'src'
-        build_dir = working_dir / 'build'
-        split_dir = working_dir / 'split'
-        link_dir = working_dir / 'link'
-        out_dir = working_dir / 'out'
+        build_dir = working_dir / BUILD_DIR
+        split_dir = working_dir / SPLIT_DIR
+        link_dir = working_dir / LINK_DIR
+        out_dir = working_dir / OUT_DIR
         tool_dir = working_dir / 'tools'
         sym_dir = working_dir / 'symbols'
         cc_path = working_dir / 'cc.yaml'

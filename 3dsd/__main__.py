@@ -45,6 +45,15 @@ def main():
     p_check.add_argument('--single-binary', metavar='NAME',
                          help='Operate on only this binary')
 
+    # --- clean ---
+    p_clean = sub.add_parser('clean', help='Remove generated build output')
+    p_clean.add_argument('dir', help='Project working directory')
+    p_clean.add_argument('targets', nargs='*',
+                         help='build, split, link, out, ninja, objdiff, all '
+                              '(default: everything except split)')
+    p_clean.add_argument('-n', '--dry-run', action='store_true',
+                         help='List what would be removed without deleting')
+
     # --- progress ---
     p_prog = sub.add_parser('progress', help='Report matching/in-progress function stats')
     p_prog.add_argument('dir', help='Project working directory')
@@ -110,6 +119,11 @@ def main():
             from .check import run_check
             config = ProjectConfig.load(Path(args.dir), args.single_binary)
             ok = run_check(config)
+            sys.exit(0 if ok else 1)
+
+        case 'clean':
+            from .clean import run_clean
+            ok = run_clean(Path(args.dir), args.targets, args.dry_run)
             sys.exit(0 if ok else 1)
 
         case 'progress':

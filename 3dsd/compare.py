@@ -22,11 +22,10 @@ def extract_and_compare(compiled: Path, split: Path, output: Path, sym: str,
     """Compare one function from a compiled TU against its split object.
 
     The output object always gets the split (original) bytes so the final
-    link stays byte-perfect; a match is recorded via an adjacent `.match`
-    stamp file, which progress reporting reads.
+    link stays byte-perfect. The comparison result is reported separately by
+    objdiff, which diffs the target and base ELFs; nothing here records it.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
-    stamp = output.with_name(output.name + '.match')
 
     matched = False
     if compiled.exists() and compiled.stat().st_size > 0:
@@ -37,10 +36,6 @@ def extract_and_compare(compiled: Path, split: Path, output: Path, sym: str,
                                symbols_csv, base_addr, split_addr)
 
     shutil.copy2(split, output)
-    if matched:
-        stamp.touch()
-    else:
-        stamp.unlink(missing_ok=True)
     return matched
 
 

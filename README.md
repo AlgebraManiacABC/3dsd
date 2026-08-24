@@ -16,8 +16,8 @@ ALL work done in Claude Code using Opus 4.6 and Fable 5 models.
   `cc.yaml` at your install (see below)
 - GNU `ld` and `objcopy` for ARM in the project's `tools/` directory
 - Optional: [objdiff](https://github.com/encounter/objdiff) for a per-function
-  diff GUI; if `objdiff-cli` is on PATH its report is included in progress
-  output
+  diff GUI; if `objdiff-cli` is on PATH or in the project's `tools/` directory,
+  its report is included in progress output
 
 ## Project layout
 
@@ -27,8 +27,19 @@ myproject/
 ├── symbols/        one CSV per binary: code.bin.csv, ModuleX.cro.csv ...
 ├── src/
 │   └── code.bin/   sources for that binary (any folder structure below)
-├── tools/          ld, objcopy
+├── tools/          ld, objcopy (optionally objdiff-cli, armcc installs)
 └── cc.yaml         compiler configuration
+```
+
+Everything else is generated and safe to delete (see `clean` below):
+
+```
+├── build/          compiled translation units, one .o per source file
+├── split/          per-symbol .o carved out of the original binary
+├── link/           compared objects, plus <bin>_linked and its .map
+├── out/            recreated binaries, plus objdiff_base/ and objdiff_target/
+├── build.ninja     generated build graph
+└── objdiff.json    generated objdiff project
 ```
 
 Symbol CSVs have the header `Location,Name,Mode,Size,Segment`, e.g.
@@ -134,9 +145,24 @@ binary into `out/`, and prints progress. Other commands:
 | `python -m 3dsd split .`    | (re)split originals into `split/` |
 | `python -m 3dsd ninja .`    | regenerate `build.ninja` only |
 | `python -m 3dsd objdiff .`  | regenerate `objdiff.json` only |
+| `python -m 3dsd clean .`    | remove generated output |
 
 (`3dsd` starts with a digit, so there is no `import 3dsd` / pip script — always
 invoke it as `python -m 3dsd`.)
+
+### clean
+
+`clean` takes any number of targets — `build`, `split`, `link`, `out`, `ninja`
+(`build.ninja` + ninja's logs), `objdiff` (`objdiff.json`), or `all`. With no
+target it removes everything **except `split/`**, which is expensive to
+regenerate. Use `-n` / `--dry-run` to list what would go without deleting.
+
+```bash
+python -m 3dsd clean . --dry-run
+```
+
+Because `clean` removes `build.ninja`, run `python -m 3dsd ninja .` (or any
+`python -m 3dsd build .`) before invoking bare `ninja` again.
 
 ## Writing sources
 
@@ -154,11 +180,17 @@ invoke it as `python -m 3dsd`.)
 
 ```
 code.bin: 27,964 / 495,616 bytes (5.6423%)          ← exact-matched bytes (primary)
-          functions: 83 / 1,571 (5.28%), 104 with source
-          fuzzy: 34,609 bytes (6.9830%), 21 in progress (avg 56.4%)
+          functions: 83 / 1,571 (5.28%)
+          fuzzy: 6.9830%
+          data: 1,204 / 50,132 bytes (2.4016%)
 ```
 
 Byte percentages are measured against the whole binary. *Fuzzy* adds partial
-credit for in-progress functions (masked byte ratio). Open the project in the
-objdiff GUI (`objdiff.json` is generated for you) for instruction-level diffs
-of any function.
+credit for in-progress functions (masked byte ratio) and is printed only when
+it exceeds the exact figure; *data* is printed only when the binary has data
+symbols. With more than one binary a `Total` line is appended.
+
+Progress is computed by `objdiff-cli`, which is looked up on `PATH` and then in
+the project's `tools/` directory; without it the rest of the build still runs.
+Open the project in the objdiff GUI (`objdiff.json` is generated for you) for
+instruction-level diffs of any function.

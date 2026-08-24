@@ -172,7 +172,7 @@ def generate_ninja(config: ProjectConfig):
                 link_objects.append(split_o)
 
         # Link all objects (full link with linker script)
-        linked = _rel(config.out_dir / f'{bin_name}_linked')
+        linked = _rel(config.link_dir / f'{bin_name}_linked')
         obj_list = ' '.join(_escape_ninja(o) for o in link_objects)
         lines.append(f'build {_escape_ninja(linked)}: link {obj_list}')
         lines.append(f'  ldflags = {ld_flags}')
