@@ -1,4 +1,5 @@
-import sys
+import subprocess
+import tempfile
 from pathlib import Path
 
 from .ctrtype import CRO, BinaryWriter
@@ -15,12 +16,18 @@ def recreate_cro(linked_bin: Path, original_cro: Path, output: Path):
     writer.flush(output)
 
 
-def run_recreate_cro(argv: list[str]) -> int:
-    import argparse
-    parser = argparse.ArgumentParser(prog="3dsd recreate-cro")
-    parser.add_argument("--linked", required=True, help="Linked binary (objcopy output)")
-    parser.add_argument("--original", required=True, help="Original .cro file")
-    parser.add_argument("--output", required=True, help="Output .cro path")
-    args = parser.parse_args(argv)
-    recreate_cro(Path(args.linked), Path(args.original), Path(args.output))
-    return 0
+def cro_from_elf(linked_elf: Path, original_cro: Path, output: Path, objcopy: Path):
+    """Flatten a linked ELF and splice it into a CRO in one step.
+
+    objcopy only writes to a file, so the raw payload goes to the system
+    temp directory and is discarded immediately — it never lands in out/.
+    """
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        raw = Path(td) / 'linked.bin'
+        result = subprocess.run(
+            [str(objcopy), str(linked_elf), '-O', 'binary', str(raw)])
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"objcopy failed on {linked_elf} (exit {result.returncode})")
+        recreate_cro(raw, original_cro, output)

@@ -72,8 +72,8 @@ def generate_ninja(config: ProjectConfig):
         '  command = $objcopy $in -O binary $out',
         '  description = BIN $out',
         '',
-        'rule recreate_cro',
-        '  command = $tool recreate-cro --linked $in --original $original --output $out',
+        'rule cro_from_elf',
+        '  command = $tool cro-from-elf --linked $in --original $original --output $out --objcopy $objcopy',
         '  description = CRO $out',
         '',
         'rule link_base',
@@ -189,14 +189,10 @@ def generate_ninja(config: ProjectConfig):
         # Convert to binary
         is_cro = '.cro' in bin_name
         if is_cro:
-            temp_bin = _rel(config.out_dir / f'{bin_name}.temp')
             final_bin = _rel(config.out_dir / bin_name)
             orig_bin = _rel(next(p for p in config.originals if p.name == bin_name))
 
-            lines.append(f'build {_escape_ninja(temp_bin)}: to_binary {_escape_ninja(linked)}')
-            lines.append('')
-
-            lines.append(f'build {_escape_ninja(final_bin)}: recreate_cro {_escape_ninja(temp_bin)}')
+            lines.append(f'build {_escape_ninja(final_bin)}: cro_from_elf {_escape_ninja(linked)}')
             lines.append(f'  original = {orig_bin}')
             lines.append('')
         else:

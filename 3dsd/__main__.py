@@ -77,11 +77,13 @@ def main():
     p_ec.add_argument('--base-addr', type=lambda x: int(x, 0), default=0)
     p_ec.add_argument('--split-addr', type=lambda x: int(x, 0), default=0)
 
-    # --- recreate-cro (internal, called by Ninja) ---
-    p_cro = sub.add_parser('recreate-cro', help='Recreate a CRO module (internal)')
+    # --- cro-from-elf (internal, called by Ninja) ---
+    p_cro = sub.add_parser('cro-from-elf',
+                           help='Flatten a linked ELF into a CRO module (internal)')
     p_cro.add_argument('--linked', required=True)
     p_cro.add_argument('--original', required=True)
     p_cro.add_argument('--output', required=True)
+    p_cro.add_argument('--objcopy', required=True)
 
     # --- check-file (internal, called by Ninja) ---
     p_chkfile = sub.add_parser('check-file', help='Verify a single binary (internal)')
@@ -154,9 +156,10 @@ def main():
                 split_addr=args.split_addr,
             )
 
-        case 'recreate-cro':
-            from .recreate import recreate_cro
-            recreate_cro(Path(args.linked), Path(args.original), Path(args.output))
+        case 'cro-from-elf':
+            from .recreate import cro_from_elf
+            cro_from_elf(Path(args.linked), Path(args.original),
+                         Path(args.output), Path(args.objcopy))
 
         case 'check-file':
             from .check import check_binary
