@@ -84,6 +84,12 @@ def report_progress(config: ProjectConfig):
     """Report decomp progress using objdiff-cli."""
     cli = shutil.which('objdiff-cli')
     if not cli:
+        for name in ('objdiff-cli', 'objdiff-cli.exe'):
+            candidate = config.tool_dir / name
+            if candidate.exists():
+                cli = str(candidate)
+                break
+    if not cli:
         print("  objdiff-cli not found — install it for progress reporting.")
         return
 
