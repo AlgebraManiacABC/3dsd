@@ -34,33 +34,88 @@ myproject/
 Symbol CSVs have the header `Location,Name,Mode,Size,Segment`, e.g.
 `00100000,Entry,$a,00000002,".text"` (`$a` = ARM, `$t` = Thumb; hex sizes).
 
+## Compiler & tools setup
+
+The pipeline needs two things in addition to your sources and symbols:
+
+1. **`tools/`** — GNU binutils for ARM (`ld` and `objcopy`). These are the
+   standard `arm-none-eabi-` binutils from [devkitPro](https://devkitpro.org/)
+   or any ARM GCC toolchain. Copy or symlink the executables into `tools/`:
+
+   ```
+   tools/
+   ├── ld           (or ld.exe)
+   └── objcopy      (or objcopy.exe)
+   ```
+
+2. **armcc** — the ARM Compiler that the game was originally built with. The
+   pipeline does **not** bundle it. You need the exact version that matches the
+   original binary (different builds produce different code). Each compiler
+   install is a directory containing `bin/armcc` and `include/`.
+
+   Point `cc.yaml` at your install(s) in one of two ways:
+
+   - **Named in `compilers:`** (recommended) — map a version-tagged name to
+     the install root. The name format `armcc_<version>_<build>` is verified
+     at runtime against `armcc --vsn`:
+
+     ```yaml
+     compilers:
+       armcc_4.1_1049: C:/armcc_4.1_b1049
+       armcc_5.0_169:  /opt/armcc/5.0/b169
+     ```
+
+   - **Placed in `tools/`** — drop the install directory (or a symlink) in
+     `tools/` and reference it by directory name:
+
+     ```yaml
+     default:
+       cc: armcc_4.1_1049      # looks for tools/armcc_4.1_1049
+     ```
+
+   The compiler's own `include/` directory is appended to the flags
+   automatically (`-I<install>/include`).
+
 ## cc.yaml
 
 ```yaml
 compilers:
-  # name -> armcc install root (containing bin/ and include/).
-  # The version in the name is verified against `armcc --vsn`.
   armcc_4.1_1049: C:/armcc_4.1_b1049
 
 default:
   cc: armcc_4.1_1049
   flags: []
 
-presets:            # optional, reusable flag sets
+presets:
   thumb: {cc: armcc_4.1_1049, flags: [--thumb]}
 
 code.bin:
-  ignored: [wip/*]          # glob patterns to skip
+  ignored: [wip/*]
   presets:
-    thumb: [FUN_00100794.c] # apply a preset to specific files
-  "*.cpp":                  # wildcard rules
+    thumb: [FUN_00100794.c]
+  "*.cpp":
     cc: armcc_4.1_1049
     flags: [--cpu=MPCore, -O3, --split_sections, -Iinclude]
 ```
 
-The compiler's own `include/` directory is added automatically. Use
-`--split_sections` in your flags — it is what enables multiple functions per
-source file.
+Use `--split_sections` in your flags — it is what enables multiple functions
+per source file.
+
+### cc.yaml reference
+
+| Key | Scope | Description |
+|-----|-------|-------------|
+| `compilers:` | top-level | Map of compiler names to install paths |
+| `default:` | top-level | Fallback `{cc, flags}` for any file without a specific rule |
+| `presets:` | top-level | Named `{cc, flags}` bundles reusable across binaries |
+| `<binary>:` | top-level | Per-binary overrides (key = binary filename, e.g. `code.bin`) |
+| `ignored:` | per-binary | List of glob patterns for source files to skip |
+| `presets:` | per-binary | Map of preset name to list of files/globs that use it |
+| `<filename>:` | per-binary | Direct `{cc, flags}` for one source file |
+| `"<glob>":` | per-binary | Wildcard `{cc, flags}` applied to matching source files |
+
+Rules are resolved in order: direct filename match > preset match > wildcard
+match > `default`. The first match wins.
 
 ## Usage
 
