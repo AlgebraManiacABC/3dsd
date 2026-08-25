@@ -1,6 +1,8 @@
 import json
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .config import ProjectConfig
@@ -84,7 +86,22 @@ _COLUMNS = ('Binary', 'Code bytes', 'Code %', 'Fuzzy %',
             'Functions 100%', 'Func %', 'Data bytes', 'Total bytes', 'Total %')
 
 
-def measure_row(measures: dict, label: str) -> list[str]:
+_RATIO = 'r'   # cell holding "numerator / denominator"
+_TEXT = 't'    # cell holding a single value
+
+# A cell is (kind, left, right, tint). `tint` is the completion fraction used
+# for colouring, or None for values that do not move during a decomp.
+
+
+def _text(value: str, tint: float | None = None) -> tuple:
+    return (_TEXT, value, '', tint)
+
+
+def _ratio(num: str, den: str, tint: float | None) -> tuple:
+    return (_RATIO, num, den, tint)
+
+
+def measure_row(measures: dict, label: str) -> list[tuple]:
     """Render one objdiff measures block as a row of table cells.
 
     Percentages follow objdiff: code is a fraction of total_code, not of the
@@ -102,43 +119,122 @@ def measure_row(measures: dict, label: str) -> list[str]:
     has_md = 'matched_data' in measures
     md = int(measures['matched_data']) if has_md else 0
 
-    if td:
-        data = f'{md:,} / {td:,}' if has_md else f'{td:,}'
-    else:
-        data = '-'
-
+    code_f = (mc / tc) if tc else None
+    func_f = (mf / tf) if tf else None
     grand_total = tc + td
     grand_matched = mc + md  # md is 0 unless objdiff measured it
+    grand_f = (grand_matched / grand_total) if grand_total else None
+
+    if td and has_md:
+        data_cell = _ratio(f'{md:,}', f'{td:,}', md / td)
+    elif td:
+        # Only a size: objdiff reported no matched-data figure to colour.
+        data_cell = _text(f'{td:,}')
+    else:
+        data_cell = _text('-')
 
     return [
-        label,
-        f'{mc:,} / {tc:,}' if tc else '-',
-        f'{code_pct:.4f}%' if tc else '-',
-        f'{fuzzy_pct:.4f}%' if tc else '-',
-        f'{mf:,} / {tf:,}' if tf else '-',
-        f'{mf / tf * 100:.2f}%' if tf else '-',
-        data,
-        f'{grand_matched:,} / {grand_total:,}' if grand_total else '-',
-        f'{grand_matched / grand_total * 100:.4f}%' if grand_total else '-',
+        _text(label),
+        _ratio(f'{mc:,}', f'{tc:,}', code_f) if tc else _text('-'),
+        _text(f'{code_pct:.4f}%', code_f) if tc else _text('-'),
+        _text(f'{fuzzy_pct:.4f}%', fuzzy_pct / 100) if tc else _text('-'),
+        _ratio(f'{mf:,}', f'{tf:,}', func_f) if tf else _text('-'),
+        _text(f'{mf / tf * 100:.2f}%', func_f) if tf else _text('-'),
+        data_cell,
+        _ratio(f'{grand_matched:,}', f'{grand_total:,}', grand_f) if grand_total else _text('-'),
+        _text(f'{grand_f * 100:.4f}%', grand_f) if grand_total else _text('-'),
     ]
 
 
-def format_table(rows: list[list[str]], total_row: list[str] | None = None) -> str:
-    """Lay out measure rows as a fixed-width table."""
-    all_rows = rows + ([total_row] if total_row else [])
-    widths = [len(h) for h in _COLUMNS]
-    for row in all_rows:
-        for i, cell in enumerate(row):
-            widths[i] = max(widths[i], len(cell))
+def _gradient(t: float) -> tuple[int, int, int]:
+    """Red at 0, yellow at 0.5, green at 1."""
+    t = max(0.0, min(1.0, t))
+    if t < 0.5:
+        return (255, round(510 * t), 0)
+    return (round(510 * (1 - t)), 255, 0)
 
-    def line(cells: list[str]) -> str:
-        # First column left-aligned (names), numeric columns right-aligned.
-        out = [cells[0].ljust(widths[0])]
-        out += [c.rjust(widths[i]) for i, c in enumerate(cells[1:], 1)]
-        return '  ' + ' | '.join(out)
+
+def _paint(text: str, tint: float | None, color: bool) -> str:
+    if not color or tint is None:
+        return text
+    r, g, b = _gradient(tint)
+    return f'\x1b[38;2;{r};{g};{b}m{text}\x1b[0m'
+
+
+def supports_color(stream=None) -> bool:
+    """True if ANSI colour is safe to emit on this stream."""
+    stream = stream or sys.stdout
+    if os.environ.get('NO_COLOR'):
+        return False
+    if not hasattr(stream, 'isatty') or not stream.isatty():
+        return False
+    if os.name == 'nt':
+        # Legacy consoles print escapes literally unless VT mode is enabled.
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.GetStdHandle(-11)
+            mode = ctypes.c_ulong()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            if not mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+                if not kernel32.SetConsoleMode(
+                        handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def format_table(rows: list[list[tuple]], total_row: list[tuple] | None = None,
+                 color: bool | None = None) -> str:
+    """Lay out measure rows as a fixed-width table.
+
+    Ratio cells get their numerator and denominator sized independently so the
+    separators line up down the column regardless of magnitude.
+    """
+    if color is None:
+        color = supports_color()
+
+    all_rows = rows + ([total_row] if total_row else [])
+    ncols = len(_COLUMNS)
+
+    # Per column: numerator/denominator widths for ratio cells, plus the width
+    # any plain cell needs.
+    num_w = [0] * ncols
+    den_w = [0] * ncols
+    flat_w = [len(h) for h in _COLUMNS]
+    for row in all_rows:
+        for i, (kind, left, right, _) in enumerate(row):
+            if kind == _RATIO:
+                num_w[i] = max(num_w[i], len(left))
+                den_w[i] = max(den_w[i], len(right))
+            else:
+                flat_w[i] = max(flat_w[i], len(left))
+
+    widths = []
+    for i in range(ncols):
+        ratio_w = num_w[i] + 3 + den_w[i] if num_w[i] or den_w[i] else 0
+        widths.append(max(flat_w[i], ratio_w))
+
+    def render(cell: tuple, i: int) -> str:
+        kind, left, right, tint = cell
+        if kind == _RATIO:
+            body = (' ' * (num_w[i] - len(left)) + _paint(left, tint, color)
+                    + ' / ' + right.rjust(den_w[i]))
+            visible = num_w[i] + 3 + den_w[i]
+        else:
+            body = _paint(left, tint, color)
+            visible = len(left)
+        pad = ' ' * (widths[i] - visible)
+        return (left.ljust(widths[i]) if i == 0 else pad + body)
+
+    def line(cells: list[tuple]) -> str:
+        return '  ' + ' | '.join(render(c, i) for i, c in enumerate(cells))
 
     sep = '  ' + '-+-'.join('-' * w for w in widths)
-    parts = [line(list(_COLUMNS)), sep]
+    parts = [line([_text(h) for h in _COLUMNS]), sep]
     parts += [line(r) for r in rows]
     if total_row:
         parts.append(sep)

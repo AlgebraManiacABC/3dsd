@@ -181,15 +181,23 @@ Because `clean` removes `build.ninja`, run `python -m 3dsd ninja .` (or any
 One row per binary, plus a `Total` row when there is more than one:
 
 ```
-  Binary       |          Code bytes |  Code % | Fuzzy % | Functions 100% | Func % | Data bytes |         Total bytes | Total %
-  -------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
-  ModuleFtr.cro|         0 / 179,968 | 0.0000% | 0.0000% |        0 / 236 |  0.00% |          - |         0 / 179,968 | 0.0000%
-  code.bin     |  30,358 / 7,574,364 | 0.4008% | 0.4754% | 1,569 / 53,330 |  2.94% |  1,350,820 |  30,358 / 8,925,184 | 0.3401%
-  -------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
-  Total        | 30,358 / 12,047,532 | 0.2520% | 0.2989% | 1,569 / 55,921 |  2.81% |  1,350,820 | 30,358 / 13,398,352 | 0.2266%
+  Binary        |          Code bytes |  Code % | Fuzzy % | Functions 100% | Func % | Data bytes |         Total bytes | Total %
+  --------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
+  ModuleFtr.cro |      0 /    179,968 | 0.0000% | 0.0000% |     0 /    236 |  0.00% |          - |      0 /    179,968 | 0.0000%
+  code.bin      | 30,358 /  7,574,364 | 0.4008% | 0.4754% | 1,569 / 53,330 |  2.94% |  1,350,820 | 30,358 /  8,925,184 | 0.3401%
+  --------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
+  Total         | 30,358 / 12,047,532 | 0.2520% | 0.2989% | 1,569 / 55,921 |  2.81% |  1,350,820 | 30,358 / 13,398,352 | 0.2266%
 ```
 
-The table is about 135 columns wide with long binary names.
+The table is about 135 columns wide with long binary names. Numerators and
+denominators are sized independently, so the `/` separators line up down each
+column no matter how the magnitudes differ.
+
+Values that move during a decomp — matched byte counts, matched function
+counts, and every percentage — are coloured on a red → yellow → green scale by
+how complete they are. Fixed denominators are left uncoloured. Colour is
+emitted only when stdout is a terminal, and is disabled by setting `NO_COLOR`,
+so redirected or piped output stays plain.
 
 **Code %** is measured against the binary's **code**, not its total size — the
 denominator is objdiff's `total_code`, which excludes the bytes in the *Data
