@@ -1,5 +1,6 @@
 import csv
 import fnmatch
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -175,22 +176,47 @@ class ProjectConfig:
                 result[stem] = (path, stem)
 
         unmatched = {stem: path for stem, path in sources.items() if stem not in all_syms}
+        if not unmatched:
+            return result
+
+        # The discovery object is also keyed on the compiler and flags: editing
+        # cc.yaml must invalidate it, or section discovery silently runs against
+        # an object built with the previous settings.
+        manifest_path = self.build_dir / bin_name / '.discovery.json'
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            manifest = {}
+        dirty = False
+
         for stem, src_path in unmatched.items():
             build_o = self.build_dir / bin_name / f'{stem}.o'
+            cc_path, flags = self.get_cc(bin_name, src_path.name)
+            cc_key = f'{cc_path}|{",".join(flags)}'
             need_compile = (
                 not build_o.exists()
                 or build_o.stat().st_size == 0
                 or src_path.stat().st_mtime > build_o.stat().st_mtime
+                or manifest.get(stem) != cc_key
             )
             if need_compile:
-                cc_path, flags = self.get_cc(bin_name, src_path.name)
                 compile_source(src_path, build_o, cc_path, flags)
+                manifest[stem] = cc_key
+                dirty = True
             if build_o.exists() and build_o.stat().st_size > 0:
                 sections = discover_sections(build_o)
+                if not sections:
+                    print(f"  Warning: {src_path.name} defines no discoverable symbols "
+                          f"(no 'i.' sections). Add --split_sections to its cc.yaml flags "
+                          f"if it holds more than one function.")
                 for sec_name in sections:
                     sname = sanitize(sec_name)
                     if sname in all_syms and sname not in result:
                         result[sname] = (src_path, stem)
+
+        if dirty:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(json.dumps(manifest, indent=1))
 
         return result
 
