@@ -1,4 +1,5 @@
 import hashlib
+import shutil
 from pathlib import Path
 
 from .config import ProjectConfig, SYMBOLS_DIR
@@ -91,7 +92,6 @@ def run_split(config: ProjectConfig, progress: bool = True):
     sym_dir = config.working_dir / SYMBOLS_DIR
     for name in config.binaries:
         split_dir = config.split_dir / name
-        split_dir.mkdir(parents=True, exist_ok=True)
         stamp = split_dir / '.split_stamp'
         key = _split_key(config.binaries[name], sym_dir / f'{name}.csv')
 
@@ -99,6 +99,13 @@ def run_split(config: ProjectConfig, progress: bool = True):
             if progress:
                 print(f"  {name}: up to date")
             continue
+
+        # Start from an empty directory. Objects are named after their symbol,
+        # so a renamed or deleted CSV entry would otherwise leave its old .o
+        # behind indefinitely -- the split only ever writes, never removes.
+        if split_dir.exists():
+            shutil.rmtree(split_dir)
+        split_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"Splitting {name}...")
         symbols = config.symbols.get(name, [])
