@@ -77,7 +77,7 @@ def generate_ninja(config: ProjectConfig):
         '  description = CRO $out',
         '',
         'rule link_base',
-        '  command = $ld -r --no-warn-mismatch @$out.rsp -o $out',
+        '  command = $tool link-base --ld $ld --output $out --rsp $out.rsp',
         '  rspfile = $out.rsp',
         '  rspfile_content = $in_newline',
         '  description = LINK_BASE $out',
@@ -140,21 +140,21 @@ def generate_ninja(config: ProjectConfig):
             split_o = _rel(config.split_dir / bin_name / f'{sym_name}.o')
 
             if sym_name in source_map:
-                src_path, stem = source_map[sym_name]
-                build_o = _rel(config.build_dir / bin_name / f'{stem}.o')
+                src_path, src_key = source_map[sym_name]
+                build_o = _rel(config.obj_path(bin_name, src_key))
                 link_o = _rel(config.link_dir / bin_name / f'{sym_name}.o')
 
-                if stem not in emitted_compile:
-                    emitted_compile.add(stem)
+                if src_key not in emitted_compile:
+                    emitted_compile.add(src_key)
                     compiled_objects.append(build_o)
-                    cc_path, flags = config.get_cc(bin_name, src_path.name)
+                    cc_path, flags = config.get_cc(bin_name, src_key)
                     cc_posix = _posix(cc_path.resolve())
                     flags_arg = '--flags=' + ','.join(flags) if flags else ''
 
                     lines.append(f'build {_escape_ninja(build_o)}: compile {_escape_ninja(_rel(src_path))}')
                     lines.append(f'  cc_path = {cc_posix}')
                     lines.append(f'  flags_arg = {flags_arg}')
-                    lines.append(f'  desc = {bin_name}/{stem}')
+                    lines.append(f'  desc = {bin_name}/{src_key}')
                     lines.append('')
 
                 lines.append(f'build {_escape_ninja(link_o)}: compare {_escape_ninja(build_o)} | {_escape_ninja(split_o)}')

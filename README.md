@@ -15,6 +15,8 @@ ALL work done in Claude Code using Opus 4.6 and Fable 5 models.
 - The ARM compiler (armcc) the game was built with — **not bundled**; point
   `cc.yaml` at your install (see below)
 - GNU `ld` and `objcopy` for ARM in the project's `tools/` directory
+  (binutils 2.36+ preferred: `ld --force-group-allocation` tidies up the
+  objdiff base ELF, and is skipped when unsupported)
 - Optional: [objdiff](https://github.com/encounter/objdiff) for a per-function
   diff GUI; if `objdiff-cli` is on PATH or in the project's `tools/` directory,
   its report is included in progress output
@@ -34,7 +36,7 @@ myproject/
 Everything else is generated and safe to delete (see `clean` below):
 
 ```
-├── build/          compiled translation units, one .o per source file
+├── build/          compiled translation units, mirroring src/ (Item/Item.c.o)
 ├── split/          per-symbol .o carved out of the original binary
 ├── link/           compared objects, plus <bin>_linked and its .map
 ├── out/            recreated binaries, plus objdiff_base/ and objdiff_target/
@@ -109,8 +111,10 @@ code.bin:
     flags: [--cpu=MPCore, -O3, --split_sections, -Iinclude]
 ```
 
-Use `--split_sections` in your flags — it is what enables multiple functions
-per source file.
+Use `--split_sections` in your flags for any file holding more than one
+function — it is what lets the pipeline see the individual functions. Without
+it armcc emits a single `.text`, and the file can only stand for the one symbol
+it is named after.
 
 ### cc.yaml reference
 
@@ -122,7 +126,7 @@ per source file.
 | `<binary>:` | top-level | Per-binary overrides (key = binary filename, e.g. `code.bin`) |
 | `ignored:` | per-binary | List of glob patterns for source files to skip |
 | `presets:` | per-binary | Map of preset name to list of files/globs that use it |
-| `<filename>:` | per-binary | Direct `{cc, flags}` for one source file |
+| `<filename>:` | per-binary | Direct `{cc, flags}` for one source file (path under `src/<binary>/`, or a bare file name) |
 | `"<glob>":` | per-binary | Wildcard `{cc, flags}` applied to matching source files |
 
 Rules are resolved in order: direct filename match > preset match > wildcard
@@ -166,15 +170,35 @@ Because `clean` removes `build.ninja`, run `python -m 3dsd ninja .` (or any
 
 ## Writing sources
 
-- One function per file: name the file after the symbol
-  (`FUN_00123456.c`, `_Z9ActNpCharP6NpChar.cpp`).
-- **Multiple functions per file**: any filename works — the pipeline compiles
-  the file once and discovers which symbols it defines from its
-  `--split_sections` output, then compares each function independently.
+Source layout is free. Put one function in a file named after it, put a whole
+translation unit's worth in one file, use C or C++ — the pipeline compiles each
+file once, reads the `i.NAME` sections `--split_sections` produced, and
+compares every function it finds against the original independently.
+
+- **One function per file**: name the file after the symbol
+  (`FUN_00123456.c`, `_Z9ActNpCharP6NpChar.cpp`). No `--split_sections` needed.
+- **Many functions per file**: any filename works, including a name that
+  happens to be one of the functions inside (`inflate.c` holding `inflate`,
+  `inflateEnd` and `inflateReset`). Needs `--split_sections`.
+- **C++**: symbols are matched under their mangled names, which is what the
+  symbol CSV holds, so nothing is needed beyond the right compiler flags.
+- Files are identified by their path under `src/<binary>/`, so `zlib/util.c`
+  and `png/util.c` are distinct, as are `foo.c` and `foo.cpp`.
+- If two files define the same symbol, the file *named* after it wins; failing
+  that, the first in path order does, and the overlap is reported. Two files
+  defining the same **global** symbol will still break the objdiff base link —
+  that is a genuine conflict in the sources, not something to paper over.
 - A function counts as *matching* only if its bytes equal the original exactly,
   with relocation sites verified against the symbol CSV where the target
   address is known (and masked out where it isn't — data globals, library
   calls, unnamed functions).
+
+`3dsd ninja` compiles every source once to do this discovery (in parallel,
+cached in `build/`); on an 1,800-file project that is around 20 seconds cold
+and nothing at all once the objects are there.
+
+See [docs/multi-function-sources.md](docs/multi-function-sources.md) for how
+the objdiff base ELF is assembled and why it needs its own linker script.
 
 ## Progress output
 
