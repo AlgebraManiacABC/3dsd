@@ -195,9 +195,11 @@ column no matter how the magnitudes differ.
 
 Values that move during a decomp — matched byte counts, matched function
 counts, and every percentage — are coloured on a red → yellow → green scale by
-how complete they are. Fixed denominators are left uncoloured. Colour is
-emitted only when stdout is a terminal, and is disabled by setting `NO_COLOR`,
-so redirected or piped output stays plain.
+how complete they are. Fixed denominators are left uncoloured. Exactly zero is
+dimmed to a darker red, so a binary nobody has started is distinguishable from
+one just underway; early in a decomp the gradient alone is far too shallow to
+separate them. Colour is emitted only when stdout is a terminal, and is
+disabled by setting `NO_COLOR`, so redirected or piped output stays plain.
 
 **Code %** is measured against the binary's **code**, not its total size — the
 denominator is objdiff's `total_code`, which excludes the bytes in the *Data

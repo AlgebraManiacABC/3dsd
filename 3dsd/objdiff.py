@@ -147,8 +147,15 @@ def measure_row(measures: dict, label: str) -> list[tuple]:
 
 
 def _gradient(t: float) -> tuple[int, int, int]:
-    """Red at 0, yellow at 0.5, green at 1."""
+    """Red at 0, yellow at 0.5, green at 1.
+
+    Exactly zero is dimmed, so an untouched binary is distinguishable at a
+    glance from one that has barely started -- at early completion the ramp
+    itself is far too shallow to separate them.
+    """
     t = max(0.0, min(1.0, t))
+    if t == 0.0:
+        return (127, 0, 0)
     if t < 0.5:
         return (255, round(510 * t), 0)
     return (round(510 * (1 - t)), 255, 0)
