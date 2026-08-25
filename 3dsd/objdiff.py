@@ -80,36 +80,70 @@ def generate_objdiff(config: ProjectConfig):
     print(f"Generated {out_path}")
 
 
-def format_measures(measures: dict, label: str) -> str:
-    """Render one objdiff measures block as a progress report entry."""
-    total = int(measures.get('total_code', 0))
-    matched = int(measures.get('matched_code', 0))
-    matched_pct = float(measures.get('matched_code_percent', 0.0))
-    fuzzy_pct = float(measures.get('fuzzy_match_percent', 0.0))
-    total_funcs = int(measures.get('total_functions', 0))
-    matched_funcs = int(measures.get('matched_functions', 0))
-    func_pct = (matched_funcs / total_funcs * 100) if total_funcs else 0
-    total_data = int(measures.get('total_data', 0))
+_COLUMNS = ('Binary', 'Code bytes', 'Code %', 'Fuzzy %',
+            'Functions 100%', 'Func %', 'Data bytes', 'Total bytes', 'Total %')
 
-    indent = ' ' * (4 + len(label))
-    line = f"  {label}: {matched:,} / {total:,} bytes ({matched_pct:.4f}%)"
-    line += f"\n{indent}functions: {matched_funcs:,} / {total_funcs:,} ({func_pct:.2f}%)"
-    if fuzzy_pct > matched_pct:
-        line += f"\n{indent}fuzzy: {fuzzy_pct:.4f}%"
-    if total_data:
-        # objdiff only emits matched_data when it actually measured the data
-        # sections; report the size alone rather than a synthetic zero.
-        if 'matched_data' in measures:
-            matched_data = int(measures['matched_data'])
-            if 'matched_data_percent' in measures:
-                data_pct = float(measures['matched_data_percent'])
-            else:
-                data_pct = matched_data / total_data * 100
-            line += (f"\n{indent}data: {matched_data:,} / {total_data:,} "
-                     f"bytes ({data_pct:.4f}%)")
-        else:
-            line += f"\n{indent}data: {total_data:,} bytes (not tracked)"
-    return line
+
+def measure_row(measures: dict, label: str) -> list[str]:
+    """Render one objdiff measures block as a row of table cells.
+
+    Percentages follow objdiff: code is a fraction of total_code, not of the
+    whole binary. The total column spans code + data, and only counts matched
+    data when objdiff actually reports it.
+    """
+    tc = int(measures.get('total_code', 0))
+    mc = int(measures.get('matched_code', 0))
+    code_pct = float(measures.get('matched_code_percent', 0.0))
+    fuzzy_pct = float(measures.get('fuzzy_match_percent', 0.0))
+    tf = int(measures.get('total_functions', 0))
+    mf = int(measures.get('matched_functions', 0))
+    td = int(measures.get('total_data', 0))
+
+    has_md = 'matched_data' in measures
+    md = int(measures['matched_data']) if has_md else 0
+
+    if td:
+        data = f'{md:,} / {td:,}' if has_md else f'{td:,}'
+    else:
+        data = '-'
+
+    grand_total = tc + td
+    grand_matched = mc + md  # md is 0 unless objdiff measured it
+
+    return [
+        label,
+        f'{mc:,} / {tc:,}' if tc else '-',
+        f'{code_pct:.4f}%' if tc else '-',
+        f'{fuzzy_pct:.4f}%' if tc else '-',
+        f'{mf:,} / {tf:,}' if tf else '-',
+        f'{mf / tf * 100:.2f}%' if tf else '-',
+        data,
+        f'{grand_matched:,} / {grand_total:,}' if grand_total else '-',
+        f'{grand_matched / grand_total * 100:.4f}%' if grand_total else '-',
+    ]
+
+
+def format_table(rows: list[list[str]], total_row: list[str] | None = None) -> str:
+    """Lay out measure rows as a fixed-width table."""
+    all_rows = rows + ([total_row] if total_row else [])
+    widths = [len(h) for h in _COLUMNS]
+    for row in all_rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def line(cells: list[str]) -> str:
+        # First column left-aligned (names), numeric columns right-aligned.
+        out = [cells[0].ljust(widths[0])]
+        out += [c.rjust(widths[i]) for i, c in enumerate(cells[1:], 1)]
+        return '  ' + ' | '.join(out)
+
+    sep = '  ' + '-+-'.join('-' * w for w in widths)
+    parts = [line(list(_COLUMNS)), sep]
+    parts += [line(r) for r in rows]
+    if total_row:
+        parts.append(sep)
+        parts.append(line(total_row))
+    return '\n'.join(parts)
 
 
 def report_progress(config: ProjectConfig):
@@ -148,11 +182,9 @@ def report_progress(config: ProjectConfig):
         return
 
     units = report.get('units', [])
-    for unit in units:
-        print(format_measures(unit.get('measures', {}), unit.get('name', '?')))
-
-    if len(units) > 1:
-        print(format_measures(report.get('measures', {}), 'Total'))
+    rows = [measure_row(u.get('measures', {}), u.get('name', '?')) for u in units]
+    total = measure_row(report.get('measures', {}), 'Total') if len(units) > 1 else None
+    print(format_table(rows, total))
 
 
 def _rel(path: Path, base: Path) -> Path:

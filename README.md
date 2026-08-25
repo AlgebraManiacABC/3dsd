@@ -178,22 +178,33 @@ Because `clean` removes `build.ninja`, run `python -m 3dsd ninja .` (or any
 
 ## Progress output
 
+One row per binary, plus a `Total` row when there is more than one:
+
 ```
-code.bin: 30,358 / 7,574,364 bytes (0.4008%)         ← exact-matched bytes (primary)
-          functions: 1,569 / 53,330 (2.94%)
-          fuzzy: 0.4754%
-          data: 1,350,820 bytes (not tracked)
+  Binary       |          Code bytes |  Code % | Fuzzy % | Functions 100% | Func % | Data bytes |         Total bytes | Total %
+  -------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
+  ModuleFtr.cro|         0 / 179,968 | 0.0000% | 0.0000% |        0 / 236 |  0.00% |          - |         0 / 179,968 | 0.0000%
+  code.bin     |  30,358 / 7,574,364 | 0.4008% | 0.4754% | 1,569 / 53,330 |  2.94% |  1,350,820 |  30,358 / 8,925,184 | 0.3401%
+  -------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
+  Total        | 30,358 / 12,047,532 | 0.2520% | 0.2989% | 1,569 / 55,921 |  2.81% |  1,350,820 | 30,358 / 13,398,352 | 0.2266%
 ```
 
-Byte percentages are measured against the binary's **code**, not its total
-size — the denominator shown on the first line is objdiff's `total_code`,
-which excludes the data bytes reported on the `data` line. For the `code.bin`
-above that is 7,574,364 of 8,925,184 total bytes, so the same match reads as
-0.4008% of code but 0.3401% of the file.
+The table is about 135 columns wide with long binary names.
 
-*Fuzzy* adds partial credit for in-progress functions (masked byte ratio) and
-is printed only when it exceeds the exact figure. With more than one binary a
-`Total` line is appended, summing every unit.
+**Code %** is measured against the binary's **code**, not its total size — the
+denominator is objdiff's `total_code`, which excludes the bytes in the *Data
+bytes* column. For the `code.bin` row that is 7,574,364 of 8,925,184, so the
+same match reads as 0.4008% of code but 0.3401% of the file.
+
+**Total bytes** spans code + data, and is the closest thing to whole-binary
+completion. Its numerator counts matched data only when objdiff reports one,
+so while data is untracked it equals the code numerator and the percentage is
+a *floor*.
+
+**Fuzzy %** adds partial credit for in-progress functions (masked byte ratio),
+so it is always ≥ *Code %*. **Func %** counts only functions matching 100%,
+and is a fraction of the function *count* — not of bytes, so it moves at a
+different rate than *Code %*.
 
 The *data* line reports only the size when objdiff returns no `matched_data`
 figure, which is the normal case for whole-binary units: objdiff matches data
