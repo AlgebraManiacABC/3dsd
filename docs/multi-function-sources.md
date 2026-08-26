@@ -240,6 +240,15 @@ diffs instructions over the target symbol's extent and reports these as 100 %.
 megabyte-scale `.rodata` costs 45 minutes rather than 16 seconds. Worth
 reporting upstream; until then the base ELF stays code-only in effect.
 
+**C++ symbol names have to be mangled in the CSV.** armcc emits
+`_ZN14AcInsectCommon3F17Ev`; Ghidra exports `AcInsectCommon::F17`. Nothing
+bridges the two, so a C++ file whose CSV entries are demangled claims no
+symbols at all. `3dsd ninja` now names the files this happens to and says why.
+Teaching the pipeline to demangle would close the gap for simple methods, but
+Ghidra's spelling is not a standard demangler's — it drops parameter lists
+except where it needs them to disambiguate overloads — so it would be a
+guess-and-check mapping rather than a conversion.
+
 **`.s` / `.S` sources need `armasm` on PATH.** `_gather_sources` accepts them
 and armcc dispatches to `armasm`, which is not resolved through the
 `compilers:` install root.

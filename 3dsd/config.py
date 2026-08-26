@@ -280,7 +280,40 @@ class ProjectConfig:
             for sym in discovered[key]:
                 claim(sym, key)
 
+        _report_orphans(bin_name, sources, discovered, set(owner.values()),
+                        all_syms)
         return result
+
+
+def _report_orphans(bin_name: str, sources: dict, discovered: dict[str, list[str]],
+                    claimed_files: set[str], all_syms: set[str]):
+    """Warn about files that compiled fine but claimed nothing.
+
+    A file that builds and defines symbols, none of which the symbol CSV has,
+    is dropped from the build entirely: no compare rule, no progress, no error.
+    That is nearly always a naming mismatch rather than an empty file, and
+    without being told there is nothing to see -- the file compiles, and the
+    numbers simply never move.
+    """
+    orphans = [k for k in sorted(sources)
+               if discovered[k] and k not in claimed_files]
+    if not orphans:
+        return
+
+    print(f"  Warning: {len(orphans)} source file(s) define symbols that are "
+          f"not in symbols/{bin_name}.csv, so nothing from them is compared:")
+    for key in orphans[:10]:
+        print(f"    {key} ({len(discovered[key])} symbols, "
+              f"e.g. {discovered[key][0]})")
+    if len(orphans) > 10:
+        print(f"    ... and {len(orphans) - 10} more")
+
+    emits_mangled = any(s.startswith('_Z') for k in orphans for s in discovered[k])
+    csv_has_mangled = any(s.startswith('_Z') for s in all_syms)
+    if emits_mangled and not csv_has_mangled:
+        print("    These are C++ mangled names and the CSV holds none. Ghidra "
+              "exports demangled names by default ('Foo::bar'); the CSV needs "
+              "the mangled spelling the compiler emits ('_ZN3Foo3barEv').")
 
 
 def _scan_workers() -> int:

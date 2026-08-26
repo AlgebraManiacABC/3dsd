@@ -180,8 +180,12 @@ compares every function it finds against the original independently.
 - **Many functions per file**: any filename works, including a name that
   happens to be one of the functions inside (`inflate.c` holding `inflate`,
   `inflateEnd` and `inflateReset`). Needs `--split_sections`.
-- **C++**: symbols are matched under their mangled names, which is what the
-  symbol CSV holds, so nothing is needed beyond the right compiler flags.
+- **C++**: the compiler emits mangled names (`_ZN3Foo3barEv`), so that is the
+  spelling the symbol CSV must use. Ghidra exports *demangled* names
+  (`Foo::bar`) by default, and those will not match anything — rename the
+  target functions to their mangled form before exporting. A file whose
+  symbols are all missing from the CSV is reported when `build.ninja` is
+  generated, rather than silently contributing nothing.
 - Files are identified by their path under `src/<binary>/`, so `zlib/util.c`
   and `png/util.c` are distinct, as are `foo.c` and `foo.cpp`.
 - If two files define the same symbol, the file *named* after it wins; failing
