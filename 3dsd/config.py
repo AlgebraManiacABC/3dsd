@@ -214,7 +214,9 @@ class ProjectConfig:
                 include = install / 'include'
                 if include.is_dir():
                     flags.append(f'-I{include.as_posix()}')
-            elif not cc.exists() and not cc.with_suffix('.exe').exists():
+            elif (found := _find_executable(cc)) is not None:
+                cc = found
+            else:
                 raise Exception(
                     f"Compiler '{cc_name}' not found in {self.tool_dir}.\n"
                     f"  Set its install directory in cc.yaml, e.g.:\n"
@@ -476,6 +478,22 @@ def _binary_libraries(cc_info: dict, bin_name: str,
                 f"declared under cc.yaml's `libraries:` key.")
         out.append(libraries[n])
     return out
+
+
+def _find_executable(path: Path) -> Path | None:
+    """Locate a tools/ executable given the bare name from cc.yaml.
+
+    Not `with_suffix('.exe')`: every armcc name carries dots, so
+    `armcc_4.1_894` would be read as stem `armcc_4` plus extension `.1_894`
+    and the check would look for `armcc_4.exe`. The name is extended instead.
+
+    Toolchains are often shipped with both a Windows and an extensionless
+    Unix binary side by side, so the platform decides which one wins rather
+    than whichever happens to be tested first.
+    """
+    exe = path.with_name(path.name + '.exe')
+    order = (exe, path) if os.name == 'nt' else (path, exe)
+    return next((p for p in order if p.is_file()), None)
 
 
 def _scan_workers() -> int:

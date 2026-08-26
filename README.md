@@ -164,6 +164,23 @@ relative to the library root instead of `src/<binary>/`.
   libpng @a3f91c2: 53 of 198 discovered symbols are in symbols/code.bin.csv
   ```
 
+A headers-only entry is also the way to give a bare `tools/` compiler its
+standard headers. armcc does not locate its own `include` directory -- the
+`-I` is what makes `<string.h>` resolve -- and the pipeline can only add it
+automatically when cc.yaml names an install root under `compilers:`, or when
+`tools/<name>` is a directory. When the compiler is a lone executable in
+`tools/`, point a library at its headers instead:
+
+```yaml
+libraries:
+  armcc-headers:
+    sources: []
+    include: ["."]      # libs/armcc-headers -> the compiler's include dir
+
+code.bin:
+  libraries: [armcc-headers]
+```
+
 **This only works if the binary's symbol CSV uses the library's symbol names.**
 Library code is already inside `code.bin` at real addresses; if the CSV calls
 those addresses `FUN_0034a1c0`, a perfectly decompiled library will claim
