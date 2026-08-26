@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,9 +18,23 @@ def compile_source(source: Path, output: Path, cc: Path, flags: list[str],
     include search fails."""
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [str(cc)] + flags + ['-c', str(source), '-o', str(output)]
-    result = subprocess.run(cmd, cwd=cwd)
+    result = subprocess.run(cmd, cwd=cwd, env=_cc_env(cc))
     if result.returncode != 0:
         output.write_bytes(b'')
+
+
+def _cc_env(cc: Path) -> dict:
+    """The compiler's own directory, prepended to PATH.
+
+    armcc does not assemble `__asm` function bodies itself -- it shells out to
+    armasm, which it looks up on PATH. armasm ships alongside armcc, so without
+    this any source using embedded assembler fails with a bare
+    "'armasm' is not recognized as an internal or external command".
+    """
+    env = dict(os.environ)
+    bin_dir = str(cc.resolve().parent)
+    env['PATH'] = bin_dir + os.pathsep + env.get('PATH', '')
+    return env
 
 
 def extract_and_compare(compiled: Path, split: Path, output: Path, sym: str,

@@ -324,7 +324,12 @@ class ProjectConfig:
             build_o = self.obj_path(bin_name, key)
             if build_o.exists() and build_o.stat().st_size > 0:
                 found = [sanitize(s) for s in discover_sections(build_o)]
-                if not found and sanitize(sources[key].stem) not in all_syms:
+                # A library file contributing nothing is normal -- a game uses
+                # a fraction of a shared library, and plenty of it compiles
+                # away entirely behind #ifdefs. Only the project's own sources
+                # are worth warning about; libraries get a summary instead.
+                if (not found and sanitize(sources[key].stem) not in all_syms
+                        and not key.startswith(f'{LIB_PREFIX}/')):
                     print(f"  Warning: {key} defines no discoverable symbols "
                           f"(no 'i.' sections). Add --split_sections to its "
                           f"cc.yaml flags if it holds more than one function.")
