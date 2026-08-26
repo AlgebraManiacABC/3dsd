@@ -77,7 +77,12 @@ The pipeline needs two things in addition to your sources and symbols:
      compilers:
        armcc_4.1_1049: C:/armcc_4.1_b1049
        armcc_5.0_169:  /opt/armcc/5.0/b169
+       armcc_4.1_894:  deps/armstd_4.1_894    # relative to the project
      ```
+
+     A relative path is resolved against the project directory, not the
+     directory the command is run from, so vendoring a toolchain under `deps/`
+     keeps `cc.yaml` free of machine-specific absolute paths.
 
    - **Placed in `tools/`** — drop the install directory (or a symlink) in
      `tools/` and reference it by directory name:
@@ -210,7 +215,7 @@ empty -- the usual uninitialised-submodule case -- it says so and names the fix.
 
 | Key | Scope | Description |
 |-----|-------|-------------|
-| `compilers:` | top-level | Map of compiler names to install paths |
+| `compilers:` | top-level | Map of compiler names to install roots; relative paths resolve against the project |
 | `default:` | top-level | Fallback `{cc, flags}` for any file without a specific rule |
 | `presets:` | top-level | Named `{cc, flags}` bundles reusable across binaries |
 | `dependencies:` | top-level | Map of dependency name to its build config; it lives at `deps/<name>` |

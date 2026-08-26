@@ -191,7 +191,13 @@ class ProjectConfig:
                 flags.append(f'-I{rel_inc.as_posix()}')
 
         if cc_name in self.compilers:
+            # A relative install path is relative to the project, not to
+            # wherever the command happened to be run from -- otherwise
+            # `compilers: {name: deps/armcc_4.1_1049}` only resolves when the
+            # shell is already sitting in the project directory.
             install = Path(self.compilers[cc_name])
+            if not install.is_absolute():
+                install = self.working_dir / install
             cc = install / 'bin' / 'armcc.exe'
             if not cc.exists():
                 cc = install / 'bin' / 'armcc'
