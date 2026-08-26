@@ -187,6 +187,22 @@ names.** That code is already inside `code.bin` at real addresses; if the CSV
 calls those addresses `FUN_0034a1c0`, a perfectly decompiled library will claim
 nothing. That summary line is how you find out.
 
+Not everything under `deps/` belongs in your repository. A decompiled library
+is normally a submodule, but a vendored toolchain -- a compiler and its
+standard headers -- is licensed material that must not be committed. Ignore
+those, keeping the directory itself:
+
+```gitignore
+deps/armstd_4.1_894/*
+!deps/armstd_4.1_894/.gitkeep
+```
+
+Git cannot track an empty directory, so the `.gitkeep` is what keeps it in the
+tree. A directory holding nothing but dotfiles counts as empty, so a fresh
+clone gets the same "uninitialised submodule" message as a missing one rather
+than compiling on and failing later with `cannot open source input file
+"stdio.h"`.
+
 The pipeline never runs git commands that write. If `deps/<name>` is missing or
 empty -- the usual uninitialised-submodule case -- it says so and names the fix.
 

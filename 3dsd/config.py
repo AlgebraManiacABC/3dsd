@@ -414,7 +414,10 @@ def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
                 f"{root.as_posix()} does not exist.\n"
                 f"  If it is a git submodule, initialise it:\n"
                 f"    git submodule update --init {DEPS_DIR}/{name}")
-        if not any(root.iterdir()):
+        # Dotfiles do not count: a directory kept in git by a lone .gitkeep,
+        # with the real contents ignored or not yet checked out, is empty for
+        # every purpose that matters here.
+        if not any(p for p in root.iterdir() if not p.name.startswith('.')):
             raise Exception(
                 f"Dependency '{name}' at {root.as_posix()} is empty -- this is "
                 f"usually an uninitialised submodule.\n"
