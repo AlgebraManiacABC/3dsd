@@ -1,8 +1,10 @@
 import csv
 import fnmatch
 import json
+import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
@@ -86,11 +88,29 @@ class ProjectConfig:
                    build_dir, split_dir, link_dir, out_dir, tool_dir, symbols,
                    cc_info, compilers)
 
+    def src_key(self, binary_name: str, path: Path) -> str:
+        """Identify a source by its path relative to `src/<binary>/`.
+
+        Two files with the same name in different directories -- or a `.c` and
+        a `.cpp` sharing a stem -- are different translation units, so the
+        relative path, not the stem, is what keys compiler config, object
+        paths and the source map.
+        """
+        try:
+            return path.relative_to(self.working_dir / 'src' / binary_name).as_posix()
+        except ValueError:
+            return path.name
+
     def get_cc(self, binary_name: str, source_name: str) -> tuple[Path, list[str]]:
-        """Return (compiler_path, flags) for a given source file."""
+        """Return (compiler_path, flags) for a source, keyed by `src_key`.
+
+        Falls back to the bare file name so cc.yaml may name a file without
+        spelling out the directory it sits in.
+        """
         d = None
         if binary_name in self.cc_info and isinstance(self.cc_info[binary_name], dict):
-            d = self.cc_info[binary_name].get(source_name)
+            entries = self.cc_info[binary_name]
+            d = entries.get(source_name) or entries.get(source_name.rsplit('/', 1)[-1])
         if not d:
             d = self.cc_info.get('default')
         if not d:
@@ -159,25 +179,31 @@ class ProjectConfig:
     def objcopy_path(self) -> Path:
         return self.tool_dir / 'objcopy'
 
-    def get_source_map(self, bin_name: str) -> dict[str, tuple[Path, str]]:
-        """Return {sym_name: (source_path, file_stem)} for all symbols covered by sources.
+    def obj_path(self, bin_name: str, src_key: str) -> Path:
+        """Object file for a source, mirroring its position under `src/`.
 
-        Direct matches (stem == sym_name) are found by name.
-        Multi-function files are pre-compiled to discover their i.XXX sections.
+        The extension is kept before the `.o` so `foo.c` and `foo.cpp` in the
+        same directory do not fight over one object.
+        """
+        return self.build_dir / bin_name / f'{src_key}.o'
+
+    def get_source_map(self, bin_name: str) -> dict[str, tuple[Path, str]]:
+        """Return {sym_name: (source_path, src_key)} for every symbol a source
+        provides.
+
+        Every source is compiled once and scanned for the `i.NAME` sections
+        armcc emits under --split_sections, so a symbol is claimed no matter
+        whether it sits alone in a file named after it, among a hundred others
+        in one translation unit, or in a C++ file under a mangled name. Objects
+        are cached in `build/`; only a missing, stale or differently-configured
+        object is recompiled.
         """
         from .compare import compile_source, discover_sections
 
-        sources = {s.stem: s for s in self.sources.get(bin_name, [])}
-        all_syms = {sanitize(sym.name) for sym in self.symbols.get(bin_name, []) if sym.addr >= 0}
-
-        result: dict[str, tuple[Path, str]] = {}
-        for stem, path in sources.items():
-            if stem in all_syms:
-                result[stem] = (path, stem)
-
-        unmatched = {stem: path for stem, path in sources.items() if stem not in all_syms}
-        if not unmatched:
-            return result
+        sources = {self.src_key(bin_name, s): s
+                   for s in self.sources.get(bin_name, [])}
+        all_syms = {sanitize(sym.name) for sym in self.symbols.get(bin_name, [])
+                    if sym.addr >= 0}
 
         # The discovery object is also keyed on the compiler and flags: editing
         # cc.yaml must invalidate it, or section discovery silently runs against
@@ -187,38 +213,79 @@ class ProjectConfig:
             manifest = json.loads(manifest_path.read_text())
         except (OSError, ValueError):
             manifest = {}
-        dirty = False
 
-        for stem, src_path in unmatched.items():
-            build_o = self.build_dir / bin_name / f'{stem}.o'
-            cc_path, flags = self.get_cc(bin_name, src_path.name)
+        stale: list[tuple[str, Path, Path, str]] = []
+        for key, src_path in sources.items():
+            build_o = self.obj_path(bin_name, key)
+            cc_path, flags = self.get_cc(bin_name, key)
             cc_key = f'{cc_path}|{",".join(flags)}'
-            need_compile = (
-                not build_o.exists()
-                or build_o.stat().st_size == 0
-                or src_path.stat().st_mtime > build_o.stat().st_mtime
-                or manifest.get(stem) != cc_key
-            )
-            if need_compile:
-                compile_source(src_path, build_o, cc_path, flags)
-                manifest[stem] = cc_key
-                dirty = True
-            if build_o.exists() and build_o.stat().st_size > 0:
-                sections = discover_sections(build_o)
-                if not sections:
-                    print(f"  Warning: {src_path.name} defines no discoverable symbols "
-                          f"(no 'i.' sections). Add --split_sections to its cc.yaml flags "
-                          f"if it holds more than one function.")
-                for sec_name in sections:
-                    sname = sanitize(sec_name)
-                    if sname in all_syms and sname not in result:
-                        result[sname] = (src_path, stem)
+            if (not build_o.exists()
+                    or build_o.stat().st_size == 0
+                    or src_path.stat().st_mtime > build_o.stat().st_mtime
+                    or manifest.get(key) != cc_key):
+                stale.append((key, src_path, build_o, cc_key))
 
-        if dirty:
+        if stale:
+            print(f"  Scanning {len(stale)} source file(s) for symbols...")
+            with ThreadPoolExecutor(max_workers=_scan_workers()) as pool:
+                futures = []
+                for key, src_path, build_o, cc_key in stale:
+                    cc_path, flags = self.get_cc(bin_name, key)
+                    futures.append(pool.submit(compile_source, src_path, build_o,
+                                               cc_path, flags, self.working_dir))
+                for f in futures:
+                    f.result()
+            for key, _src, _o, cc_key in stale:
+                manifest[key] = cc_key
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text(json.dumps(manifest, indent=1))
 
+        discovered: dict[str, list[str]] = {}
+        for key in sorted(sources):
+            build_o = self.obj_path(bin_name, key)
+            if build_o.exists() and build_o.stat().st_size > 0:
+                found = [sanitize(s) for s in discover_sections(build_o)]
+                if not found and sanitize(sources[key].stem) not in all_syms:
+                    print(f"  Warning: {key} defines no discoverable symbols "
+                          f"(no 'i.' sections). Add --split_sections to its "
+                          f"cc.yaml flags if it holds more than one function.")
+                discovered[key] = found
+            else:
+                # Compile failed. The file can still claim the symbol it is
+                # named after below, so the symbol stays in the build and
+                # simply reads as unmatched.
+                discovered[key] = []
+
+        result: dict[str, tuple[Path, str]] = {}
+        owner: dict[str, str] = {}
+
+        def claim(sym: str, key: str):
+            if sym not in all_syms:
+                return
+            if sym in owner:
+                if owner[sym] != key:
+                    print(f"  Warning: {sym} is defined by both {owner[sym]} "
+                          f"and {key}; keeping {owner[sym]}.")
+                return
+            owner[sym] = key
+            result[sym] = (sources[key], key)
+
+        # A file named after a symbol owns it, even if another translation unit
+        # also happens to define it. Only then are the remaining sections of
+        # each file handed out, so adding a multi-function file cannot quietly
+        # take symbols away from the files dedicated to them.
+        for key in sorted(sources):
+            claim(sanitize(sources[key].stem), key)
+        for key in sorted(sources):
+            for sym in discovered[key]:
+                claim(sym, key)
+
         return result
+
+
+def _scan_workers() -> int:
+    """Parallelism for the symbol-discovery compiles."""
+    return min(32, (os.cpu_count() or 4) * 2)
 
 
 def _check_dirs(working_dir: Path, orig_dir: Path, tool_dir: Path,
@@ -346,9 +413,10 @@ def _resolve_cc_info(cc_info: dict, src_dir: Path) -> dict:
             if is_glob:
                 for match in src_files:
                     if fnmatch.fnmatch(match, pattern) and match not in ignored:
-                        key = match.rsplit('/', 1)[-1]
-                        if key not in binary_dict:
-                            binary_dict[key] = config
+                        # Keyed on the path relative to src/<binary>/, so two
+                        # same-named files in different folders stay distinct.
+                        if match not in binary_dict:
+                            binary_dict[match] = config
             else:
                 if pattern not in binary_dict and pattern not in ignored:
                     binary_dict[pattern] = config

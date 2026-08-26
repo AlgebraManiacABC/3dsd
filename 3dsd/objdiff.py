@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -60,6 +61,10 @@ def generate_objdiff(config: ProjectConfig):
     for name in config.binaries:
         target_path = _rel(config.out_dir / 'objdiff_target' / name, config.working_dir)
         base_elf = config.out_dir / 'objdiff_base' / name
+        if not base_elf.exists() and config.sources.get(name):
+            print(f"  Warning: no base ELF for {name}: the objdiff base link "
+                  f"has not run or failed. Progress will read as 0%; run "
+                  f"'ninja objdiff' and check the LINK_BASE output.")
         unit = {
             "name": name,
             "target_path": _posix(target_path),
@@ -299,3 +304,75 @@ def _rel(path: Path, base: Path) -> Path:
 
 def _posix(p) -> str:
     return str(p).replace('\\', '/')
+
+
+def link_base(ld: Path, output: Path, rsp: Path) -> int:
+    """Link the compiled objects into the relocatable base ELF for objdiff.
+
+    Two things have to happen that plain `ld -r` does not do:
+
+    * `base.ld` folds armcc's per-symbol `i.NAME` sections back into
+      .text/.rodata/.data/.bss so objdiff can pair them with the target.
+      `--force-group-allocation` does the same for the COMDAT groups armcc
+      puts its `__ARM_common_*` helpers in; older binutils lack the option,
+      so the link is retried without it.
+    * armcc emits R_ARM_NONE marker relocations (the printf-variant hints, for
+      one). objdiff rejects relocation type 0 outright and refuses to read the
+      whole file, so they are stripped afterwards.
+    """
+    script = Path(__file__).parent / 'base.ld'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    args = ['-r', '--no-warn-mismatch', '-T', str(script), f'@{rsp}',
+            '-o', str(output)]
+
+    result = subprocess.run([str(ld), '--force-group-allocation'] + args,
+                            capture_output=True, text=True)
+    if result.returncode != 0 and 'force-group-allocation' in result.stderr:
+        result = subprocess.run([str(ld)] + args, capture_output=True, text=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        # Ninja leaves a failed command's output in place; a half-written base
+        # ELF would be read as a real one on the next progress run.
+        output.unlink(missing_ok=True)
+        return result.returncode
+
+    removed = strip_none_relocs(output)
+    if removed:
+        print(f"  {output.name}: stripped {removed} R_ARM_NONE relocation(s)")
+    return 0
+
+
+def strip_none_relocs(path: Path) -> int:
+    """Drop every R_ARM_NONE entry from an object's REL sections, in place.
+
+    Kept entries are packed to the front of each section and the section size
+    is shrunk; nothing moves, so no offset in the file needs rewriting. The
+    few bytes left over sit between sections, unreferenced.
+    """
+    data = bytearray(path.read_bytes())
+    if len(data) < 0x34 or data[:4] != b'\x7fELF':
+        return 0
+    shoff = struct.unpack_from('<I', data, 0x20)[0]
+    shentsize, shnum = struct.unpack_from('<HH', data, 0x2E)
+
+    removed = 0
+    for i in range(shnum):
+        head = shoff + shentsize * i
+        if struct.unpack_from('<I', data, head + 4)[0] != 9:  # SHT_REL
+            continue
+        off, size = struct.unpack_from('<II', data, head + 0x10)
+        entsize = struct.unpack_from('<I', data, head + 0x24)[0] or 8
+        kept = bytearray()
+        for j in range(size // entsize):
+            entry = data[off + j * entsize: off + (j + 1) * entsize]
+            if struct.unpack_from('<I', entry, 4)[0] & 0xFF:
+                kept += entry
+            else:
+                removed += 1
+        if len(kept) != size:
+            data[off:off + len(kept)] = kept
+            struct.pack_into('<I', data, head + 0x14, len(kept))
+
+    if removed:
+        path.write_bytes(bytes(data))
+    return removed

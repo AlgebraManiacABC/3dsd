@@ -77,6 +77,12 @@ def main():
     p_ec.add_argument('--base-addr', type=lambda x: int(x, 0), default=0)
     p_ec.add_argument('--split-addr', type=lambda x: int(x, 0), default=0)
 
+    # --- link-base (internal, called by Ninja) ---
+    p_lb = sub.add_parser('link-base', help='Link the objdiff base ELF (internal)')
+    p_lb.add_argument('--ld', required=True)
+    p_lb.add_argument('--output', required=True)
+    p_lb.add_argument('--rsp', required=True)
+
     # --- cro-from-elf (internal, called by Ninja) ---
     p_cro = sub.add_parser('cro-from-elf',
                            help='Flatten a linked ELF into a CRO module (internal)')
@@ -155,6 +161,10 @@ def main():
                 base_addr=args.base_addr,
                 split_addr=args.split_addr,
             )
+
+        case 'link-base':
+            from .objdiff import link_base
+            sys.exit(link_base(Path(args.ld), Path(args.output), Path(args.rsp)))
 
         case 'cro-from-elf':
             from .recreate import cro_from_elf

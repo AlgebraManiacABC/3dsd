@@ -6,12 +6,18 @@ from .elf import ELF
 from .util import BinaryReader, get_name
 
 
-def compile_source(source: Path, output: Path, cc: Path, flags: list[str]):
+def compile_source(source: Path, output: Path, cc: Path, flags: list[str],
+                   cwd: Path | None = None):
     """Compile a translation unit. Writes an empty file on failure so the
-    build can continue (comparison then falls back to the split object)."""
+    build can continue (comparison then falls back to the split object).
+
+    `cwd` must be the project working directory whenever the flags contain
+    project-relative paths (`-Iinclude`): ninja runs the compile rule from
+    there, and section discovery has to use the same directory or the
+    include search fails."""
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [str(cc)] + flags + ['-c', str(source), '-o', str(output)]
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, cwd=cwd)
     if result.returncode != 0:
         output.write_bytes(b'')
 

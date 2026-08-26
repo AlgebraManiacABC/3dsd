@@ -14,3 +14,10 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["3dsd"]
+
+# linker.ld (final link) and base.ld (objdiff base ELF) are read at run time.
+# Keyed on "*" rather than "3dsd": setuptools validates package-data keys as
+# Python module names, and '3dsd' is not one (same reason there is no console
+# script above). There is only the one package, so "*" means the same thing.
+[tool.setuptools.package-data]
+"*" = ["*.ld"]
