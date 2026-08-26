@@ -20,14 +20,14 @@ LINK_DIR = 'link'
 OUT_DIR = 'out'
 SYMBOLS_DIR = 'symbols'
 
-# Referenced libraries live at libs/<name>, and their sources are keyed under
-# this prefix so they cannot collide with a path under src/<binary>/.
-LIBS_DIR = 'libs'
-LIB_PREFIX = '_libs'
+# Referenced dependencies live at deps/<name>, and their sources are keyed
+# under this prefix so they cannot collide with a path under src/<binary>/.
+DEPS_DIR = 'deps'
+DEP_PREFIX = '_deps'
 
 
-class Library:
-    """An external library referenced by the project, rooted at libs/<name>.
+class Dependency:
+    """An external source tree referenced by the project, rooted at deps/<name>.
 
     Nothing is assumed about the repository behind it -- no manifest, no
     layout convention, no scanning. Which directories hold sources, which hold
@@ -46,8 +46,8 @@ class Library:
         self.revision: str | None = None
 
     def src_key(self, path: Path) -> str:
-        """Key a library file as `_libs/<name>/<path below the library root>`."""
-        return f'{LIB_PREFIX}/{self.name}/{path.relative_to(self.root).as_posix()}'
+        """Key a file as `_deps/<name>/<path below the dependency root>`."""
+        return f'{DEP_PREFIX}/{self.name}/{path.relative_to(self.root).as_posix()}'
 
     def rel_files(self) -> list[str]:
         """Every compilable file under the declared source directories."""
@@ -56,7 +56,7 @@ class Library:
             base = self.root / d if d not in ('.', '') else self.root
             if not base.is_dir():
                 raise Exception(
-                    f"Library '{self.name}': source directory '{d}' does not "
+                    f"Dependency '{self.name}': source directory '{d}' does not "
                     f"exist under {self.root.as_posix()}")
             found += [f.relative_to(self.root).as_posix()
                       for f in base.rglob('*') if f.suffix in SOURCE_SUFFIXES]
@@ -77,7 +77,7 @@ class ProjectConfig:
                  out_dir: Path, tool_dir: Path,
                  symbols: dict[str, list[Symbol]],
                  cc_info: dict, compilers: dict[str, str] | None = None,
-                 libraries: dict[str, "Library"] | None = None):
+                 deps: dict[str, "Dependency"] | None = None):
         self.working_dir = working_dir
         self.originals = originals
         self.exheader = exheader
@@ -91,7 +91,7 @@ class ProjectConfig:
         self.symbols = symbols
         self.cc_info = cc_info
         self.compilers = compilers or {}
-        self.libraries = libraries or {}
+        self.deps = deps or {}
         self._verified_ccs: set[str] = set()
 
     @classmethod
@@ -115,12 +115,12 @@ class ProjectConfig:
         exh, binaries = _gather_binaries(orig_dir, single_binary)
         cc_info = yaml.safe_load(cc_path.read_text())
         compilers = cc_info.pop('compilers', None) or {}
-        # Popped before _resolve_cc_info so `libraries:` is never mistaken for
+        # Popped before _resolve_cc_info so `dependencies:` is never mistaken for
         # a binary entry, exactly as `compilers:` is.
-        libraries = _load_libraries(cc_info.pop('libraries', None), working_dir)
-        cc_info = _resolve_cc_info(cc_info, source_dir, libraries)
+        deps = _load_deps(cc_info.pop('dependencies', None), working_dir)
+        cc_info = _resolve_cc_info(cc_info, source_dir, deps)
         sources = _gather_sources(source_dir, cc_info, single_binary)
-        _add_library_sources(sources, cc_info, libraries, binaries, single_binary)
+        _add_dep_sources(sources, cc_info, deps, binaries, single_binary)
 
         symbols: dict[str, list[Symbol]] = {}
         for f in sym_dir.iterdir():
@@ -137,7 +137,7 @@ class ProjectConfig:
 
         return cls(working_dir, originals, exh, binaries, sources,
                    build_dir, split_dir, link_dir, out_dir, tool_dir, symbols,
-                   cc_info, compilers, libraries)
+                   cc_info, compilers, deps)
 
     def src_key(self, binary_name: str, path: Path) -> str:
         """Identify a source by its path relative to `src/<binary>/`.
@@ -147,9 +147,9 @@ class ProjectConfig:
         relative path, not the stem, is what keys compiler config, object
         paths and the source map.
         """
-        for lib in self.libraries.values():
+        for dep in self.deps.values():
             try:
-                return lib.src_key(path)
+                return dep.src_key(path)
             except ValueError:
                 continue
         try:
@@ -163,12 +163,12 @@ class ProjectConfig:
         Falls back to the bare file name so cc.yaml may name a file without
         spelling out the directory it sits in.
         """
-        lib = self._library_of(source_name)
-        if lib is not None:
-            # A library file is configured by its own cc.yaml section, keyed on
-            # the path below the library root.
-            rel = source_name[len(f'{LIB_PREFIX}/{lib.name}/'):]
-            entries = lib.cc_entry
+        dep = self._dependency_of(source_name)
+        if dep is not None:
+            # A dependency file is configured by its own cc.yaml section, keyed
+            # on the path below the dependency root.
+            rel = source_name[len(f'{DEP_PREFIX}/{dep.name}/'):]
+            entries = dep.cc_entry
         else:
             entries = self.cc_info.get(binary_name)
             entries = entries if isinstance(entries, dict) else {}
@@ -183,9 +183,9 @@ class ProjectConfig:
         flags = list(d.get('flags', []))
 
         # Every source built for this binary can include the headers of every
-        # library the binary declares, so game code reaches library headers and
-        # one library reaches another's.
-        for consumed in _binary_libraries(self.cc_info, binary_name, self.libraries):
+        # dependency the binary declares, so game code reaches its headers and
+        # one dependency reaches another's.
+        for consumed in _binary_deps(self.cc_info, binary_name, self.deps):
             for inc in consumed.include_dirs:
                 rel_inc = (consumed.root / inc).relative_to(self.working_dir)
                 flags.append(f'-I{rel_inc.as_posix()}')
@@ -226,12 +226,12 @@ class ProjectConfig:
         self._verify_cc(cc_name, cc)
         return cc, flags
 
-    def _library_of(self, src_key: str) -> "Library | None":
-        """The library a `_libs/<name>/...` key belongs to, if any."""
-        if not src_key.startswith(f'{LIB_PREFIX}/'):
+    def _dependency_of(self, src_key: str) -> "Dependency | None":
+        """The dependency a `_deps/<name>/...` key belongs to, if any."""
+        if not src_key.startswith(f'{DEP_PREFIX}/'):
             return None
         name = src_key.split('/', 2)[1]
-        return self.libraries.get(name)
+        return self.deps.get(name)
 
     def _verify_cc(self, cc_name: str, cc_path: Path):
         """Check the compiler binary reports the version encoded in its name."""
@@ -326,12 +326,12 @@ class ProjectConfig:
             build_o = self.obj_path(bin_name, key)
             if build_o.exists() and build_o.stat().st_size > 0:
                 found = [sanitize(s) for s in discover_sections(build_o)]
-                # A library file contributing nothing is normal -- a game uses
+                # A dependency file contributing nothing is normal -- a game uses
                 # a fraction of a shared library, and plenty of it compiles
                 # away entirely behind #ifdefs. Only the project's own sources
-                # are worth warning about; libraries get a summary instead.
+                # are worth warning about; dependencies get a summary instead.
                 if (not found and sanitize(sources[key].stem) not in all_syms
-                        and not key.startswith(f'{LIB_PREFIX}/')):
+                        and not key.startswith(f'{DEP_PREFIX}/')):
                     print(f"  Warning: {key} defines no discoverable symbols "
                           f"(no 'i.' sections). Add --split_sections to its "
                           f"cc.yaml flags if it holds more than one function.")
@@ -361,12 +361,12 @@ class ProjectConfig:
         # each file handed out, so adding a multi-function file cannot quietly
         # take symbols away from the files dedicated to them.
         #
-        # The project's own sources go first in both passes: a vendored library
+        # The project's own sources go first in both passes: a vendored file
         # must never take a symbol away from the file the project wrote for it.
         # Sort order cannot express this -- '_' falls between the upper and
         # lower case letters -- so the two origins are partitioned explicitly.
-        own = sorted(k for k in sources if not k.startswith(f'{LIB_PREFIX}/'))
-        vendored = sorted(k for k in sources if k.startswith(f'{LIB_PREFIX}/'))
+        own = sorted(k for k in sources if not k.startswith(f'{DEP_PREFIX}/'))
+        vendored = sorted(k for k in sources if k.startswith(f'{DEP_PREFIX}/'))
         for group in (own, vendored):
             for key in group:
                 claim(sanitize(sources[key].stem), key)
@@ -374,79 +374,79 @@ class ProjectConfig:
                 for sym in discovered[key]:
                     claim(sym, key)
 
-        self._report_libraries(bin_name, vendored, discovered, owner)
+        self._report_deps(bin_name, vendored, discovered, owner)
         return result
 
-    def _report_libraries(self, bin_name: str, vendored: list[str],
+    def _report_deps(self, bin_name: str, vendored: list[str],
                           discovered: dict[str, list[str]], owner: dict[str, str]):
-        """One summary line per library, instead of per-file warnings.
+        """One summary line per dependency, instead of per-file warnings.
 
-        A shared library defines far more than any one game uses, so a file
+        A dependency usually defines far more than any one game uses, so a file
         that claims nothing is normal and not worth warning about. The counts
-        are still worth printing: a library contributing zero almost always
-        means the binary's CSV does not use the library's symbol names, which
+        are still worth printing: a dependency contributing zero almost always
+        means the binary's CSV does not use its symbol names, which
         is otherwise invisible.
         """
-        for name, lib in self.libraries.items():
-            prefix = f'{LIB_PREFIX}/{name}/'
+        for name, dep in self.deps.items():
+            prefix = f'{DEP_PREFIX}/{name}/'
             keys = [k for k in vendored if k.startswith(prefix)]
             if not keys:
                 continue
             found = len({s for k in keys for s in discovered[k]})
             claimed = sum(1 for k in owner.values() if k.startswith(prefix))
-            rev = f' @{lib.revision}' if lib.revision else ''
+            rev = f' @{dep.revision}' if dep.revision else ''
             print(f"  {name}{rev}: {claimed} of {found} discovered symbols "
                   f"are in symbols/{bin_name}.csv")
 
-def _load_libraries(lib_info: dict, working_dir: Path) -> dict[str, "Library"]:
-    """Build the Library objects declared under cc.yaml's `libraries:` key."""
-    libraries: dict[str, Library] = {}
-    for name, entry in (lib_info or {}).items():
+def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
+    """Build the Dependency objects declared under cc.yaml's `dependencies:` key."""
+    deps: dict[str, Dependency] = {}
+    for name, entry in (dep_info or {}).items():
         if not isinstance(entry, dict):
             raise Exception(
-                f"Library '{name}' in cc.yaml must be a mapping, not "
+                f"Dependency '{name}' in cc.yaml must be a mapping, not "
                 f"{type(entry).__name__}.")
 
-        root = working_dir / LIBS_DIR / name
+        root = working_dir / DEPS_DIR / name
         if not root.is_dir():
             raise Exception(
-                f"Library '{name}' is declared in cc.yaml but "
+                f"Dependency '{name}' is declared in cc.yaml but "
                 f"{root.as_posix()} does not exist.\n"
                 f"  If it is a git submodule, initialise it:\n"
-                f"    git submodule update --init {LIBS_DIR}/{name}")
+                f"    git submodule update --init {DEPS_DIR}/{name}")
         if not any(root.iterdir()):
             raise Exception(
-                f"Library '{name}' at {root.as_posix()} is empty -- this is "
+                f"Dependency '{name}' at {root.as_posix()} is empty -- this is "
                 f"usually an uninitialised submodule.\n"
                 f"  Populate it with:\n"
-                f"    git submodule update --init {LIBS_DIR}/{name}")
+                f"    git submodule update --init {DEPS_DIR}/{name}")
         # Flags reach the compile rule comma-joined and are split back on ','
         # (ninja.py / __main__.py), so a comma in an -I path would silently
         # tear the command line in half.
         if ',' in root.as_posix():
             raise Exception(
-                f"Library '{name}': the path {root.as_posix()} contains a "
+                f"Dependency '{name}': the path {root.as_posix()} contains a "
                 f"comma, which cannot be passed through the compile rule's "
                 f"flag list. Rename the directory.")
 
         if 'sources' not in entry:
             raise Exception(
-                f"Library '{name}' must declare `sources:` -- a list of "
-                f"directories under {LIBS_DIR}/{name} to compile (use [] for a "
+                f"Dependency '{name}' must declare `sources:` -- a list of "
+                f"directories under {DEPS_DIR}/{name} to compile (use [] for a "
                 f"headers-only reference). Nothing is inferred from the "
-                f"library's own layout.")
+                f"dependency's own layout.")
         source_dirs = list(entry.pop('sources') or [])
         include_dirs = list(entry.pop('include', None) or [])
         for d in include_dirs:
             if not (root / d).is_dir():
                 raise Exception(
-                    f"Library '{name}': include directory '{d}' does not exist "
+                    f"Dependency '{name}': include directory '{d}' does not exist "
                     f"under {root.as_posix()}")
 
-        lib = Library(name, root, source_dirs, include_dirs, entry)
-        lib.revision = _git_revision(root)
-        libraries[name] = lib
-    return libraries
+        dep = Dependency(name, root, source_dirs, include_dirs, entry)
+        dep.revision = _git_revision(root)
+        deps[name] = dep
+    return deps
 
 
 def _git_revision(root: Path) -> str | None:
@@ -461,22 +461,22 @@ def _git_revision(root: Path) -> str | None:
     return r.stdout.strip() or None
 
 
-def _binary_libraries(cc_info: dict, bin_name: str,
-                      libraries: dict[str, "Library"]) -> list["Library"]:
-    """The libraries a binary declares it consumes, in declaration order."""
+def _binary_deps(cc_info: dict, bin_name: str,
+                      deps: dict[str, "Dependency"]) -> list["Dependency"]:
+    """The dependencies a binary declares it consumes, in declaration order."""
     entry = cc_info.get(bin_name)
     if not isinstance(entry, dict):
         return []
-    names = entry.get('libraries') or []
+    names = entry.get('dependencies') or []
     if isinstance(names, str):
         names = [names]
     out = []
     for n in names:
-        if n not in libraries:
+        if n not in deps:
             raise Exception(
-                f"Binary '{bin_name}' lists library '{n}', which is not "
-                f"declared under cc.yaml's `libraries:` key.")
-        out.append(libraries[n])
+                f"Binary '{bin_name}' lists dependency '{n}', which is not "
+                f"declared under cc.yaml's `dependencies:` key.")
+        out.append(deps[n])
     return out
 
 
@@ -571,10 +571,10 @@ def _gather_sources(src_path: Path, cc_info: dict, module: str = None) -> dict[s
         if d_info:
             for pat in d_info.get('ignored', []):
                 ignored.update(sub_dir.rglob(pat))
-        if (sub_dir / LIB_PREFIX).exists():
+        if (sub_dir / DEP_PREFIX).exists():
             raise Exception(
-                f"{sub_dir.as_posix()}/{LIB_PREFIX} is reserved: referenced "
-                f"library sources are keyed under '{LIB_PREFIX}/'. Rename it.")
+                f"{sub_dir.as_posix()}/{DEP_PREFIX} is reserved: referenced "
+                f"dependency sources are keyed under '{DEP_PREFIX}/'. Rename it.")
 
         objects[sub_dir.name] = [
             p for p in sub_dir.rglob('*')
@@ -583,38 +583,38 @@ def _gather_sources(src_path: Path, cc_info: dict, module: str = None) -> dict[s
     return objects
 
 
-def _add_library_sources(sources: dict[str, list[Path]], cc_info: dict,
-                         libraries: dict[str, "Library"], binaries: dict,
+def _add_dep_sources(sources: dict[str, list[Path]], cc_info: dict,
+                         deps: dict[str, "Dependency"], binaries: dict,
                          module: str = None):
-    """Add each binary's declared libraries to its source list, in place.
+    """Add each binary's declared dependencies to its source list, in place.
 
-    A library serving several binaries is compiled once per binary, since each
+    A dependency serving several binaries is compiled once per binary, as each
     binary has its own symbol CSV and its own objects under build/<binary>/.
     """
     for bin_name in binaries:
         if module and bin_name != module:
             continue
-        for lib in _binary_libraries(cc_info, bin_name, libraries):
+        for dep in _binary_deps(cc_info, bin_name, deps):
             ignored = set()
-            for pat in lib.cc_entry.get('ignored', []):
-                ignored.update(f for f in lib.rel_files() if fnmatch.fnmatch(f, pat))
-            files = [lib.root / f for f in lib.rel_files() if f not in ignored]
+            for pat in dep.cc_entry.get('ignored', []):
+                ignored.update(f for f in dep.rel_files() if fnmatch.fnmatch(f, pat))
+            files = [dep.root / f for f in dep.rel_files() if f not in ignored]
             sources.setdefault(bin_name, []).extend(files)
 
 
-# Keys inside a binary or library entry that configure the entry itself
+# Keys inside a binary or dependency entry that configure the entry itself
 # rather than naming a source file.
-_ENTRY_KEYWORDS = {'ignored', 'libraries'}
+_ENTRY_KEYWORDS = {'ignored', 'dependencies'}
 
 
 def _resolve_cc_info(cc_info: dict, src_dir: Path,
-                     libraries: dict[str, "Library"] | None = None) -> dict:
+                     deps: dict[str, "Dependency"] | None = None) -> dict:
     """Resolve preset definitions and wildcard patterns in cc.yaml.
 
-    Library entries are expanded by the same code as binary entries, so a
-    library supports `presets:`, `ignored:`, wildcards and per-file overrides
+    Dependency entries are expanded by the same code as binary entries, so a
+    dependency supports `presets:`, `ignored:`, wildcards and per-file settings
     with no separate configuration vocabulary -- the only difference is that
-    its paths are relative to the library root instead of src/<binary>/.
+    its paths are relative to the dependency root instead of src/<binary>/.
     """
     preset_defs = cc_info.pop('presets', {})
 
@@ -630,8 +630,8 @@ def _resolve_cc_info(cc_info: dict, src_dir: Path,
 
         _expand_entry(binary_name, binary_dict, preset_defs, _files)
 
-    for lib in (libraries or {}).values():
-        _expand_entry(lib.name, lib.cc_entry, preset_defs, lib.rel_files)
+    for dep in (deps or {}).values():
+        _expand_entry(dep.name, dep.cc_entry, preset_defs, dep.rel_files)
 
     return cc_info
 
