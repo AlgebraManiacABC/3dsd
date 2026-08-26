@@ -29,6 +29,7 @@ myproject/
 ├── symbols/        one CSV per binary: code.bin.csv, ModuleX.cro.csv ...
 ├── src/
 │   └── code.bin/   sources for that binary (any folder structure below)
+├── libs/           referenced external libraries, one directory each
 ├── tools/          ld, objcopy (optionally objdiff-cli, armcc installs)
 └── cc.yaml         compiler configuration
 ```
@@ -116,6 +117,61 @@ function — it is what lets the pipeline see the individual functions. Without
 it armcc emits a single `.text`, and the file can only stand for the one symbol
 it is named after.
 
+## Referencing external libraries
+
+3DS games share libraries -- `nw4c`, `nnsdk`, zlib, libpng -- and some of them
+are decompilation projects in their own right. Rather than copying that code
+into `src/`, point at it: put the library at `libs/<name>` (a git submodule is
+the natural way, and pins a revision for free) and describe it in `cc.yaml`.
+
+Nothing is assumed about the library's own layout. It is treated as an inert
+directory of files, and *everything* about how to build it is declared by your
+project -- which is what lets an arbitrary upstream repo be used unmodified.
+
+```yaml
+libraries:
+  libpng:
+    sources: ["."]        # directories under libs/libpng to compile
+    include: ["."]        # -I roots under libs/libpng
+    "*.c":
+      cc: armcc_4.1_894
+      flags: [--cpu=MPCore, -O3, --split_sections]
+
+code.bin:
+  libraries: [libpng]     # binaries declare what they consume
+```
+
+A library entry accepts everything a binary entry does -- `ignored:`,
+`presets:`, wildcards and per-file `{cc, flags}` overrides -- and falls back to
+`default:` like anything else. The only difference is that its paths are
+relative to the library root instead of `src/<binary>/`.
+
+- `sources:` is required. Use `[]` for a headers-only reference; nothing is
+  inferred from the library's layout.
+- `include:` directories are added as `-I` to **every** source compiled for a
+  binary that declares the library, so your own code can include library
+  headers, and one library can include another's.
+- Library files are compiled as ordinary translation units and compared
+  per-function, exactly like your own sources, and count toward the binary's
+  progress. A library serving several binaries is compiled once per binary.
+- Your own sources always win: if a file under `src/` and a library file define
+  the same symbol, `src/` claims it and the overlap is reported.
+- A shared library defines far more than any one game uses. Files that claim
+  nothing are skipped silently and never reach the build graph; instead one
+  summary line is printed per library:
+
+  ```
+  libpng @a3f91c2: 53 of 198 discovered symbols are in symbols/code.bin.csv
+  ```
+
+**This only works if the binary's symbol CSV uses the library's symbol names.**
+Library code is already inside `code.bin` at real addresses; if the CSV calls
+those addresses `FUN_0034a1c0`, a perfectly decompiled library will claim
+nothing. That summary line is how you find out.
+
+The pipeline never runs git commands that write. If `libs/<name>` is missing or
+empty -- the usual uninitialised-submodule case -- it says so and names the fix.
+
 ### cc.yaml reference
 
 | Key | Scope | Description |
@@ -123,7 +179,9 @@ it is named after.
 | `compilers:` | top-level | Map of compiler names to install paths |
 | `default:` | top-level | Fallback `{cc, flags}` for any file without a specific rule |
 | `presets:` | top-level | Named `{cc, flags}` bundles reusable across binaries |
+| `libraries:` | top-level | Map of library name to its build config; the library lives at `libs/<name>` |
 | `<binary>:` | top-level | Per-binary overrides (key = binary filename, e.g. `code.bin`) |
+| `libraries:` | per-binary | List of library names this binary consumes |
 | `ignored:` | per-binary | List of glob patterns for source files to skip |
 | `presets:` | per-binary | Map of preset name to list of files/globs that use it |
 | `<filename>:` | per-binary | Direct `{cc, flags}` for one source file (path under `src/<binary>/`, or a bare file name) |
