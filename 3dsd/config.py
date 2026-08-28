@@ -130,6 +130,9 @@ class ProjectConfig:
                 continue
             sym_list = _gather_symbols(f)
             bin_name = f.stem
+            # Before the addresses go relative, so the report quotes the same
+            # addresses the CSV and Ghidra do.
+            _check_unique_names(f, sym_list)
             if bin_name in binaries:
                 for sym in sym_list:
                     sym.addr -= binaries[bin_name].base_addr
@@ -203,7 +206,7 @@ class ProjectConfig:
                 cc = install / 'bin' / 'armcc'
             if not cc.exists():
                 raise Exception(
-                    f"Compiler '{cc_name}': no armcc executable found under {install / 'bin'}")
+                    f"Compiler '{cc_name}': no armcc executable found under {install.resolve() / 'bin'}")
             include = install / 'include'
             if include.is_dir():
                 flags.append(f'-I{include.as_posix()}')
@@ -216,7 +219,7 @@ class ProjectConfig:
                     cc = install / 'bin' / 'armcc'
                 if not cc.exists():
                     raise Exception(
-                        f"Compiler '{cc_name}': no armcc executable in {install / 'bin'}")
+                        f"Compiler '{cc_name}': no armcc executable in {install.resolve() / 'bin'}")
                 include = install / 'include'
                 if include.is_dir():
                     flags.append(f'-I{include.as_posix()}')
@@ -403,6 +406,53 @@ class ProjectConfig:
             rev = f' @{dep.revision}' if dep.revision else ''
             print(f"  {name}{rev}: {claimed} of {found} discovered symbols "
                   f"are in symbols/{bin_name}.csv")
+
+def _check_unique_names(sym_path: Path, symbols: list[Symbol]) -> None:
+    """Reject a symbol CSV that names two symbols the same.
+
+    A name is a symbol's identity throughout the pipeline: it becomes the split
+    object's filename and the symbol written inside it. Duplicates are quietly
+    destructive -- each one overwrites the last during the split, so the
+    original bytes of every symbol but the final one go missing -- and then the
+    link is handed the same object once per occurrence and fails with a
+    `multiple definition` naming one file on both sides.
+
+    Names are compared after `sanitize`, which is what actually reaches the
+    filesystem: two names that differ only in characters sanitize rewrites
+    would collide just as destructively.
+    """
+    groups: dict[str, list[Symbol]] = {}
+    for sym in symbols:
+        groups.setdefault(sanitize(sym.name), []).append(sym)
+    clashes = sorted((g for g in groups.values() if len(g) > 1),
+                     key=len, reverse=True)
+    if not clashes:
+        return
+
+    total = sum(len(g) for g in clashes)
+    lines = [
+        f"Duplicate symbol names in {sym_path.name}: "
+        f"{total:,} symbols share {len(clashes):,} names.",
+        "  A name is a symbol's identity here: it becomes the split object's",
+        "  filename and the symbol inside it. Duplicates overwrite each other",
+        "  during the split -- losing the original bytes of all but the last --",
+        "  and then hand ld the same object once per occurrence.",
+    ]
+    for group in clashes[:10]:
+        names = sorted({s.name for s in group})
+        shown = names[0] if len(names) == 1 else f"{names[0]} (+{len(names) - 1} more)"
+        addrs = ", ".join(f"{s.addr:08x}" for s in group[:2])
+        lines.append(f"    {len(group):6,}x  {shown}   (e.g. {addrs})")
+    if len(clashes) > 10:
+        lines.append(f"    ... and {len(clashes) - 10:,} more")
+    lines += [
+        "  Fix this in the export. Give them the names the compiler emits --",
+        "  RTTI vtables and typeinfo mangle as _ZTV<class> / _ZTI<class> -- or",
+        "  leave labels that cannot be named uniquely out of the CSV entirely:",
+        "  the pipeline already covers unnamed regions by address.",
+    ]
+    raise Exception('\n'.join(lines))
+
 
 def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
     """Build the Dependency objects declared under cc.yaml's `dependencies:` key."""
