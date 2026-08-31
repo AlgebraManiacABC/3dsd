@@ -28,6 +28,9 @@ def main():
     p_objdiff.add_argument('dir', help='Project working directory')
     p_objdiff.add_argument('--single-binary', metavar='NAME',
                            help='Operate on only this binary')
+    p_objdiff.add_argument('--symbol', '--function', dest='symbol', metavar='NAME',
+                           help='Diff one symbol against the original instead of '
+                                'regenerating objdiff.json (--function is an alias)')
 
     # --- build ---
     p_build = sub.add_parser('build', help='Run ninja build')
@@ -116,8 +119,10 @@ def main():
 
         case 'objdiff':
             from .config import ProjectConfig
-            from .objdiff import generate_objdiff
+            from .objdiff import generate_objdiff, diff_symbol
             config = ProjectConfig.load(Path(args.dir), args.single_binary)
+            if args.symbol:
+                sys.exit(diff_symbol(config, args.symbol))
             generate_objdiff(config)
 
         case 'build':

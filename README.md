@@ -307,6 +307,38 @@ and nothing at all once the objects are there.
 See [docs/multi-function-sources.md](docs/multi-function-sources.md) for how
 the objdiff base ELF is assembled and why it needs its own linker script.
 
+## Diffing one symbol
+
+```bash
+python -m 3dsd objdiff . --function _ZNSsaSEPKc
+python -m 3dsd objdiff . --symbol   _ZNSsaSEPKc     # same thing
+```
+
+```
+  std::string::operator=(char const*)
+    code.bin  std.cpp  76 bytes  98.00% match
+
+    original           compiled
+    ----------------   ----------------
+    push {r4, lr}    | push {r4, lr}
+    blx 0x1ec440     | bl __aeabi_memcpy-0x4 <<
+    pop {r4, pc}     | pop {r4, pc}
+```
+
+Rather than measure one function against the whole binary, this builds a unit
+covering just the source file that defines it: the original bytes on one side,
+that file's compiled object on the other. `<<` marks the instructions objdiff
+considers different.
+
+Two things to read carefully:
+
+- A branch to a symbol **outside** the file shows as a difference even when the
+  instruction is identical, because objdiff has no symbol at that address to
+  name. The `bl __aeabi_memcpy` above is that case -- the call is right, the
+  callee is simply not in the CSV.
+- The literal pool is excluded here, unlike the byte comparison, so the
+  percentage describes the instructions only.
+
 ## Progress output
 
 One row per binary, plus a `Total` row when there is more than one:

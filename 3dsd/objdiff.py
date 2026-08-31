@@ -1,12 +1,14 @@
+import bisect
 import json
 import os
 import shutil
 import struct
 import subprocess
 import sys
+from itertools import zip_longest
 from pathlib import Path
 
-from .config import ProjectConfig
+from .config import ProjectConfig, sanitize
 from .elf import write_target_elf
 from .util import Symbol
 
@@ -254,15 +256,21 @@ def format_table(rows: list[list[tuple]], total_row: list[tuple] | None = None,
     return '\n'.join(parts)
 
 
+def find_cli(config: ProjectConfig) -> str | None:
+    """Locate objdiff-cli on PATH or in the project's tools/ directory."""
+    cli = shutil.which('objdiff-cli')
+    if cli:
+        return cli
+    for name in ('objdiff-cli', 'objdiff-cli.exe'):
+        candidate = config.tool_dir / name
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def report_progress(config: ProjectConfig):
     """Report decomp progress using objdiff-cli."""
-    cli = shutil.which('objdiff-cli')
-    if not cli:
-        for name in ('objdiff-cli', 'objdiff-cli.exe'):
-            candidate = config.tool_dir / name
-            if candidate.exists():
-                cli = str(candidate)
-                break
+    cli = find_cli(config)
     if not cli:
         print("  objdiff-cli not found — install it for progress reporting.")
         return
@@ -376,3 +384,157 @@ def strip_none_relocs(path: Path) -> int:
     if removed:
         path.write_bytes(bytes(data))
     return removed
+
+
+# --- single-symbol diffing --------------------------------------------------
+
+def _unit_extent(config: ProjectConfig, bin_name: str, sym, next_addr: int,
+                 widen: bool = True) -> int:
+    """How many bytes of the original belong to `sym`.
+
+    The same rule the comparison uses: the declared size, never past the next
+    symbol, widened to the compiled length when a literal pool follows.
+    """
+    size = min(sym.size, next_addr - sym.addr)
+    if not widen:
+        return size
+    compiled = config.compiled_size(bin_name, sanitize(sym.name))
+    if compiled and compiled > size and sym.addr + compiled <= next_addr:
+        size = compiled
+    return size
+
+
+def build_unit_pair(config: ProjectConfig, bin_name: str, src_key: str,
+                    source_map: dict, widen: bool = True) -> tuple[Path, Path] | None:
+    """Write a target/base ELF pair covering one source file's symbols.
+
+    The target holds the original bytes of exactly the symbols that file
+    claims, laid end to end; the base is that file's object folded through
+    base.ld the same way the whole-binary base is. Comparing the pair gives
+    per-file totals instead of measuring one file against the whole binary.
+    """
+    from .elf import write_target_elf
+
+    data = config.binaries[bin_name].data
+    by_addr = {s.addr: s for s in config.symbols.get(bin_name, []) if s.addr >= 0}
+    addrs = sorted(by_addr)
+    mine = sorted((s for a, s in by_addr.items()
+                   if sanitize(s.name) in source_map
+                   and source_map[sanitize(s.name)][1] == src_key),
+                  key=lambda s: s.addr)
+    if not mine:
+        return None
+
+    # A contiguous slice, not a concatenation. Splicing the symbols together
+    # would change the distance between them, and every PC-relative branch
+    # inside the file would decode to the wrong target -- objdiff then reports
+    # a call as differing when it is identical. Keeping the original spacing
+    # costs some bytes and keeps every relative reference intact.
+    extents = []
+    for s in mine:
+        i = bisect.bisect_right(addrs, s.addr)
+        nxt = addrs[i] if i < len(addrs) else len(data)
+        extents.append((s, _unit_extent(config, bin_name, s, nxt, widen)))
+    start = mine[0].addr
+    end = max(s.addr + size for s, size in extents)
+    blob = data[start:end]
+
+    # Only this file's symbols get entries. Adding the neighbours would let
+    # objdiff name more branch targets, but it also drags in the odd-sized
+    # symbols a Ghidra export is littered with, and objdiff refuses to
+    # disassemble a symbol whose size is not a multiple of two -- one of them
+    # anywhere in the unit aborts the whole diff.
+    placed = [Symbol(s.addr - start, s.name, s.mode, size, '.text')
+              for s, size in extents]
+
+    out_dir = config.out_dir / 'objdiff_units' / bin_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = src_key.replace('/', '_')
+    target = out_dir / f'{stem}.target.o'
+    base = out_dir / f'{stem}.base.o'
+    write_target_elf(target, bytes(blob), placed)
+
+    obj = config.obj_path(bin_name, src_key)
+    if not obj.exists() or obj.stat().st_size == 0:
+        return None
+    rsp = out_dir / f'{stem}.rsp'
+    rsp.write_text(_posix(obj.resolve()))
+    if link_base(config.ld_path().resolve(), base, rsp) != 0:
+        return None
+    rsp.unlink(missing_ok=True)
+    return target, base
+
+
+def diff_symbol(config: ProjectConfig, name: str) -> int:
+    """Show objdiff's instruction-level diff for one symbol."""
+    cli = find_cli(config)
+    if not cli:
+        print("  objdiff-cli not found — put it on PATH or in tools/.")
+        return 1
+
+    for bin_name in config.binaries:
+        source_map = config.get_source_map(bin_name)
+        key = sanitize(name)
+        if key not in source_map:
+            continue
+        src_path, src_key = source_map[key]
+        # Not widened here: objdiff disassembles whatever the symbol covers,
+        # so including the literal pool renders it as a nonsense instruction
+        # and drags the percentage down on a function that does match.
+        pair = build_unit_pair(config, bin_name, src_key, source_map, widen=False)
+        if pair is None:
+            print(f"  {name}: {src_key} has no compiled object to compare against.")
+            return 1
+        target, base = pair
+        return _render_diff(cli, config, bin_name, src_key, key, target, base)
+
+    print(f"  No source claims '{name}'.")
+    print(f"  It must be defined by a file under src/ (or a dependency) and "
+          f"named in symbols/<binary>.csv.")
+    return 1
+
+
+def _render_diff(cli: str, config: ProjectConfig, bin_name: str, src_key: str,
+                 name: str, target: Path, base: Path) -> int:
+    out = target.with_suffix('.diff.json')
+    r = subprocess.run([cli, 'diff', '-1', str(target), '-2', str(base),
+                        '-o', str(out), '--format', 'json', name],
+                       capture_output=True, text=True, cwd=config.working_dir)
+    if r.returncode != 0 or not out.exists():
+        sys.stderr.write(r.stderr)
+        return r.returncode or 1
+    try:
+        doc = json.loads(out.read_text())
+    except json.JSONDecodeError:
+        print("  objdiff-cli produced unparseable output")
+        return 1
+
+    def pick(side):
+        return next((s for s in doc.get(side, {}).get('symbols', [])
+                     if s.get('name') == name), None)
+
+    left, right = pick('left'), pick('right')
+    if left is None or right is None:
+        print(f"  {name} is not present on both sides of the diff.")
+        return 1
+
+    pct = left.get('match_percent', 0.0)
+    print(f"  {left.get('demangled_name') or name}")
+    print(f"    {bin_name}  {src_key}  {left.get('size')} bytes  "
+          f"{pct:.2f}% match")
+    print()
+
+    def text(row):
+        # A row with no instruction is objdiff padding one side against the
+        # other, where one has an instruction the other does not.
+        return ((row or {}).get('instruction') or {}).get('formatted', '')
+
+    li, ri = left.get('instructions', []), right.get('instructions', [])
+    width = max([len(text(i)) for i in li] + [8])
+    print(f"    {'original':{width}}   compiled")
+    print(f"    {'-' * width}   {'-' * width}")
+    for a, b in zip_longest(li, ri):
+        differs = bool((a or {}).get('diff_kind') or (b or {}).get('diff_kind'))
+        mark = ' <<' if differs else ''
+        print(f"    {text(a):{width}} | {text(b)}{mark}".rstrip())
+    return 0
