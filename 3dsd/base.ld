@@ -1,10 +1,11 @@
 /* Linker script for the objdiff base ELF (ld -r).
  *
  * armcc --split_sections gives every function AND every data object its own
- * `i.NAME` section. objdiff pairs base and target sections by name, and the
- * target ELF only ever has .text/.rodata/.data/.bss, so without this script a
- * split build produces a base full of `i.png_sig_cmp`-style sections that pair
- * with nothing at all and report 0%.
+ * `i.NAME` section, and every template instantiation a `t.NAME` one. objdiff
+ * pairs base and target sections by name, and the target ELF only ever has
+ * .text/.rodata/.data/.bss, so without this script a split build produces a
+ * base full of `i.png_sig_cmp`-style sections that pair with nothing at all
+ * and report 0%.
  *
  * Routing is by section flags, not by name: `i.png_sig_cmp` is code (AX) but
  * `i.png_libpng_ver` is data (WA), and only the flags tell them apart.
@@ -24,21 +25,21 @@ SECTIONS
 {
   .text 0 :
   {
-    INPUT_SECTION_FLAGS (SHF_EXECINSTR) *(i.* .text*)
+    INPUT_SECTION_FLAGS (SHF_EXECINSTR) *(i.* t.* .text*)
   }
   .constdata 0 :
   {
-    INPUT_SECTION_FLAGS (!SHF_WRITE & !SHF_EXECINSTR) *(i.*)
+    INPUT_SECTION_FLAGS (!SHF_WRITE & !SHF_EXECINSTR) *(i.* t.*)
     *(.constdata* .conststring* .rodata*)
   }
   .rwdata 0 :
   {
-    INPUT_SECTION_FLAGS (SHF_WRITE) *(i.*)
+    INPUT_SECTION_FLAGS (SHF_WRITE) *(i.* t.*)
     *(.data* .bss* .zi*)
   }
   /DISCARD/ :
   {
     *(.debug*) *(.ARM.exidx*) *(.ARM.extab*)
-    *(.comment) *(.arm_vfe_header) *(.ARM.attributes)
+    *(.comment) *(.arm_vfe*) *(.ARM.attributes)
   }
 }
