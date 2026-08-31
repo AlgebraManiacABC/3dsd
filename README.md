@@ -274,6 +274,9 @@ compares every function it finds against the original independently.
 
 - **One function per file**: name the file after the symbol
   (`FUN_00123456.c`, `_Z9ActNpCharP6NpChar.cpp`). No `--split_sections` needed.
+- **C++ templates**: instantiations land in `t.NAME` sections rather than
+  `i.NAME`, and are discovered the same way -- a C++ file is usually mostly
+  these.
 - **Many functions per file**: any filename works, including a name that
   happens to be one of the functions inside (`inflate.c` holding `inflate`,
   `inflateEnd` and `inflateReset`). Needs `--split_sections`.
@@ -285,6 +288,13 @@ compares every function it finds against the original independently.
   that, the first in path order does, and the overlap is reported. Two files
   defining the same **global** symbol will still break the objdiff base link —
   that is a genuine conflict in the sources, not something to paper over.
+- A function's **literal pool** is compared with it. armcc keeps the pool at the
+  end of the function's own section, while a symbol's size covers only its
+  instructions -- so the compiled form is often a few bytes longer. Rather than
+  asking you to overstate the size in Ghidra (the pool is data, not code), the
+  comparison widens to cover the trailing padding and pool, but never past the
+  next symbol. Widening only ever makes a comparison stricter, so it cannot
+  invent a match, and the linked output is untouched.
 - A function counts as *matching* only if its bytes equal the original exactly,
   with relocation sites verified against the symbol CSV where the target
   address is known (and masked out where it isn't — data globals, library

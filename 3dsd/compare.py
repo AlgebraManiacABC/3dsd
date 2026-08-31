@@ -39,12 +39,17 @@ def _cc_env(cc: Path) -> dict:
 
 def extract_and_compare(compiled: Path, split: Path, output: Path, sym: str,
                         symbols_csv: Path | None, base_addr: int,
-                        split_addr: int) -> bool:
-    """Compare one function from a compiled TU against its split object.
+                        split_addr: int, compare_split: Path | None = None) -> bool:
+    """Compare one function from a compiled TU against its original bytes.
 
     The output object always gets the split (original) bytes so the final
     link stays byte-perfect. The comparison result is reported separately by
     objdiff, which diffs the target and base ELFs; nothing here records it.
+
+    `compare_split` overrides what the comparison reads, without affecting
+    what is linked. It carries the symbol's bytes extended over the trailing
+    padding and literal pool that armcc keeps inside the function's own
+    section but which the symbol's declared size does not cover.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -52,7 +57,8 @@ def extract_and_compare(compiled: Path, split: Path, output: Path, sym: str,
     if compiled.exists() and compiled.stat().st_size > 0:
         compiled_elf = ELF.from_section(compiled, sym)
         if compiled_elf is not None:
-            split_elf = ELF.from_path(split)
+            reference = compare_split if compare_split and compare_split.exists() else split
+            split_elf = ELF.from_path(reference)
             matched = _matches(compiled_elf, split_elf, sym,
                                symbols_csv, base_addr, split_addr)
 
@@ -77,8 +83,12 @@ def _matches(compiled: ELF, split: ELF, sym: str, symbols_csv: Path | None,
 
 
 def discover_sections(obj_path: Path) -> list[str]:
-    """Read an ELF .o and return all function names with 'i.' sections
-    (created by armcc --split_sections)."""
+    """Read an ELF .o and return every symbol armcc gave its own section.
+
+    --split_sections uses `i.NAME` for ordinary functions and `t.NAME` for
+    template instantiations; a C++ translation unit is usually full of the
+    latter, so missing them hides most of what it defines.
+    """
     try:
         data = obj_path.read_bytes()
     except (OSError, ValueError):
@@ -108,9 +118,50 @@ def discover_sections(obj_path: Path) -> list[str]:
         reader.seek(shoff + 0x28 * i)
         name_off = reader.read_u32()
         name = get_name(shstrtab, name_off) if name_off < len(shstrtab) else ''
-        if name.startswith('i.'):
+        if name.startswith(('i.', 't.')):
             names.append(name[2:])
     return names
+
+
+def discover_section_sizes(obj_path: Path) -> dict[str, int]:
+    """Byte size of each `i.NAME`/`t.NAME` section, plus `.text`, by symbol.
+
+    Mirrors what `ELF.from_section` will later read, so a caller can learn how
+    long the compiled form of a symbol is without parsing the object again.
+    """
+    try:
+        data = obj_path.read_bytes()
+    except (OSError, ValueError):
+        return {}
+    if len(data) < 0x34 or data[:4] != b'ELF':
+        return {}
+
+    reader = BinaryReader(obj_path.name, data)
+    reader.seek(0x20)
+    shoff = reader.read_u32()
+    reader.seek(0x30)
+    shnum = reader.read_u16()
+    shstrndx = reader.read_u16()
+    if shstrndx >= shnum:
+        return {}
+
+    reader.seek(shoff + 0x28 * shstrndx + 0x10)
+    shstrtab_off = reader.read_u32()
+    reader.seek(shoff + 0x28 * shstrndx + 0x14)
+    shstrtab_size = reader.read_u32()
+    reader.seek(shstrtab_off)
+    shstrtab = reader.read_bytes(shstrtab_size)
+
+    sizes = {}
+    for i in range(shnum):
+        reader.seek(shoff + 0x28 * i)
+        name_off = reader.read_u32()
+        name = get_name(shstrtab, name_off) if name_off < len(shstrtab) else ''
+        if not (name.startswith(('i.', 't.')) or name == '.text'):
+            continue
+        reader.seek(shoff + 0x28 * i + 0x14)
+        sizes[name[2:] if name[1:2] == '.' else name] = reader.read_u32()
+    return sizes
 
 
 def _load_sym_addrs(csv_path: Path, base_addr: int) -> dict[str, int]:

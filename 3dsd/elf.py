@@ -253,14 +253,19 @@ class ELF:
 
     @classmethod
     def from_section(cls, path: Path, sym: str) -> "ELF | None":
-        """Load one function's code from an object file: its `i.SYM` section
-        (armcc --split_sections), falling back to `.text` for single-function
-        objects. Returns None if neither section exists."""
+        """Load one function's code from an object file.
+
+        armcc --split_sections names an ordinary function's section `i.SYM`
+        and a template instantiation's `t.SYM`; a single-function object
+        compiled without the option just has `.text`. Returns None if none of
+        them is present.
+        """
         reader = BinaryReader.from_path(path)
-        elf = cls.from_reader(reader, f'i.{sym}')
-        if elf is None:
-            elf = cls.from_reader(reader, '.text')
-        return elf
+        for name in (f'i.{sym}', f't.{sym}', '.text'):
+            elf = cls.from_reader(reader, name)
+            if elf is not None:
+                return elf
+        return None
 
     @classmethod
     def from_bytes_single(cls, b: bytes, symbol: Symbol) -> "ELF":

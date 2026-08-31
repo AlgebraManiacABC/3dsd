@@ -93,6 +93,9 @@ class ProjectConfig:
         self.compilers = compilers or {}
         self.deps = deps or {}
         self._verified_ccs: set[str] = set()
+        # {binary: {symbol: compiled section length}}, filled by get_source_map
+        # and read by the ninja generator to size the comparison window.
+        self._compiled_sizes: dict[str, dict[str, int]] = {}
 
     @classmethod
     def load(cls, working_dir: Path, single_binary: str = None) -> "ProjectConfig":
@@ -288,7 +291,7 @@ class ProjectConfig:
         are cached in `build/`; only a missing, stale or differently-configured
         object is recompiled.
         """
-        from .compare import compile_source, discover_sections
+        from .compare import compile_source, discover_sections, discover_section_sizes
 
         sources = {self.src_key(bin_name, s): s
                    for s in self.sources.get(bin_name, [])}
@@ -331,8 +334,10 @@ class ProjectConfig:
             manifest_path.write_text(json.dumps(manifest, indent=1))
 
         discovered: dict[str, list[str]] = {}
+        sizes_by_key: dict[str, dict[str, int]] = {}
         for key in sorted(sources):
             build_o = self.obj_path(bin_name, key)
+            sizes_by_key[key] = discover_section_sizes(build_o)
             if build_o.exists() and build_o.stat().st_size > 0:
                 found = [sanitize(s) for s in discover_sections(build_o)]
                 # A dependency file contributing nothing is normal -- a game uses
@@ -383,8 +388,22 @@ class ProjectConfig:
                 for sym in discovered[key]:
                     claim(sym, key)
 
+        # Record how long each claimed symbol is once compiled. A function's
+        # literal pool lives at the end of its own section, so this is often
+        # longer than the size the symbol CSV gives.
+        compiled = self._compiled_sizes.setdefault(bin_name, {})
+        for sym, key in owner.items():
+            by_sym = sizes_by_key.get(key) or {}
+            size = by_sym.get(sym, by_sym.get('.text'))
+            if size:
+                compiled[sym] = size
+
         self._report_deps(bin_name, vendored, discovered, owner)
         return result
+
+    def compiled_size(self, bin_name: str, sym: str) -> int | None:
+        """Length of `sym` as the compiler emits it, if it has been discovered."""
+        return self._compiled_sizes.get(bin_name, {}).get(sym)
 
     def _report_deps(self, bin_name: str, vendored: list[str],
                           discovered: dict[str, list[str]], owner: dict[str, str]):
