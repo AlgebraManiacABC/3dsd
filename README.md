@@ -29,6 +29,7 @@ myproject/
 ├── symbols/        one CSV per binary: code.bin.csv, ModuleX.cro.csv ...
 ├── src/
 │   └── code.bin/   sources for that binary (any folder structure below)
+├── deps/           referenced external source trees, one directory each
 ├── tools/          ld, objcopy (optionally objdiff-cli, armcc installs)
 └── cc.yaml         compiler configuration
 ```
@@ -76,7 +77,12 @@ The pipeline needs two things in addition to your sources and symbols:
      compilers:
        armcc_4.1_1049: C:/armcc_4.1_b1049
        armcc_5.0_169:  /opt/armcc/5.0/b169
+       armcc_4.1_894:  deps/armstd_4.1_894    # relative to the project
      ```
+
+     A relative path is resolved against the project directory, not the
+     directory the command is run from, so vendoring a toolchain under `deps/`
+     keeps `cc.yaml` free of machine-specific absolute paths.
 
    - **Placed in `tools/`** — drop the install directory (or a symlink) in
      `tools/` and reference it by directory name:
@@ -116,14 +122,105 @@ function — it is what lets the pipeline see the individual functions. Without
 it armcc emits a single `.text`, and the file can only stand for the one symbol
 it is named after.
 
+## Referencing external dependencies
+
+3DS games share libraries -- `nw4c`, `nnsdk`, zlib, libpng -- and some of them
+are decompilation projects in their own right. Rather than copying that code
+into `src/`, point at it: put it under `deps/<name>` (a git submodule is the
+natural way, and pins a revision for free) and describe it in `cc.yaml`.
+
+Nothing is assumed about the dependency's own layout. It is treated as an
+inert directory of files, and *everything* about how to build it is declared by
+your project -- which is what lets an arbitrary upstream repo be used
+unmodified.
+
+```yaml
+dependencies:
+  libpng:
+    sources: ["."]        # directories under deps/libpng to compile
+    include: ["."]        # -I roots under deps/libpng
+    "*.c":
+      cc: armcc_4.1_894
+      flags: [--cpu=MPCore, -O3, --split_sections]
+
+code.bin:
+  dependencies: [libpng]  # binaries declare what they consume
+```
+
+A dependency entry accepts everything a binary entry does -- `ignored:`,
+`presets:`, wildcards and per-file `{cc, flags}` overrides -- and falls back to
+`default:` like anything else. The only difference is that its paths are
+relative to the dependency root instead of `src/<binary>/`.
+
+- `sources:` is required. Use `[]` for a headers-only reference; nothing is
+  inferred from the dependency's layout.
+- `include:` directories are added as `-I` to **every** source compiled for a
+  binary that declares the dependency, so your own code can include its
+  headers, and one dependency can include another's.
+- Dependency files are compiled as ordinary translation units and compared
+  per-function, exactly like your own sources, and count toward the binary's
+  progress. A dependency serving several binaries is compiled once per binary.
+- Your own sources always win: if a file under `src/` and a dependency file
+  define the same symbol, `src/` claims it and the overlap is reported.
+- A dependency usually defines far more than any one game uses. Files that
+  claim nothing are skipped silently and never reach the build graph; instead
+  one summary line is printed per dependency:
+
+  ```
+  libpng @a3f91c2: 53 of 198 discovered symbols are in symbols/code.bin.csv
+  ```
+
+A headers-only entry is also the way to give a bare `tools/` compiler its
+standard headers. armcc does not locate its own `include` directory -- the
+`-I` is what makes `<string.h>` resolve -- and the pipeline can only add it
+automatically when cc.yaml names an install root under `compilers:`, or when
+`tools/<name>` is a directory. When the compiler is a lone executable in
+`tools/`, point a dependency at its headers instead:
+
+```yaml
+dependencies:
+  armcc-headers:
+    sources: []
+    include: ["."]      # deps/armcc-headers -> the compiler's include dir
+
+code.bin:
+  dependencies: [armcc-headers]
+```
+
+**This only works if the binary's symbol CSV uses the dependency's symbol
+names.** That code is already inside `code.bin` at real addresses; if the CSV
+calls those addresses `FUN_0034a1c0`, a perfectly decompiled library will claim
+nothing. That summary line is how you find out.
+
+Not everything under `deps/` belongs in your repository. A decompiled library
+is normally a submodule, but a vendored toolchain -- a compiler and its
+standard headers -- is licensed material that must not be committed. Ignore
+those, keeping the directory itself:
+
+```gitignore
+deps/armstd_4.1_894/*
+!deps/armstd_4.1_894/.gitkeep
+```
+
+Git cannot track an empty directory, so the `.gitkeep` is what keeps it in the
+tree. A directory holding nothing but dotfiles counts as empty, so a fresh
+clone gets the same "uninitialised submodule" message as a missing one rather
+than compiling on and failing later with `cannot open source input file
+"stdio.h"`.
+
+The pipeline never runs git commands that write. If `deps/<name>` is missing or
+empty -- the usual uninitialised-submodule case -- it says so and names the fix.
+
 ### cc.yaml reference
 
 | Key | Scope | Description |
 |-----|-------|-------------|
-| `compilers:` | top-level | Map of compiler names to install paths |
+| `compilers:` | top-level | Map of compiler names to install roots; relative paths resolve against the project |
 | `default:` | top-level | Fallback `{cc, flags}` for any file without a specific rule |
 | `presets:` | top-level | Named `{cc, flags}` bundles reusable across binaries |
+| `dependencies:` | top-level | Map of dependency name to its build config; it lives at `deps/<name>` |
 | `<binary>:` | top-level | Per-binary overrides (key = binary filename, e.g. `code.bin`) |
+| `dependencies:` | per-binary | List of dependency names this binary consumes |
 | `ignored:` | per-binary | List of glob patterns for source files to skip |
 | `presets:` | per-binary | Map of preset name to list of files/globs that use it |
 | `<filename>:` | per-binary | Direct `{cc, flags}` for one source file (path under `src/<binary>/`, or a bare file name) |
@@ -177,6 +274,9 @@ compares every function it finds against the original independently.
 
 - **One function per file**: name the file after the symbol
   (`FUN_00123456.c`, `_Z9ActNpCharP6NpChar.cpp`). No `--split_sections` needed.
+- **C++ templates**: instantiations land in `t.NAME` sections rather than
+  `i.NAME`, and are discovered the same way -- a C++ file is usually mostly
+  these.
 - **Many functions per file**: any filename works, including a name that
   happens to be one of the functions inside (`inflate.c` holding `inflate`,
   `inflateEnd` and `inflateReset`). Needs `--split_sections`.
@@ -188,6 +288,13 @@ compares every function it finds against the original independently.
   that, the first in path order does, and the overlap is reported. Two files
   defining the same **global** symbol will still break the objdiff base link —
   that is a genuine conflict in the sources, not something to paper over.
+- A function's **literal pool** is compared with it. armcc keeps the pool at the
+  end of the function's own section, while a symbol's size covers only its
+  instructions -- so the compiled form is often a few bytes longer. Rather than
+  asking you to overstate the size in Ghidra (the pool is data, not code), the
+  comparison widens to cover the trailing padding and pool, but never past the
+  next symbol. Widening only ever makes a comparison stricter, so it cannot
+  invent a match, and the linked output is untouched.
 - A function counts as *matching* only if its bytes equal the original exactly,
   with relocation sites verified against the symbol CSV where the target
   address is known (and masked out where it isn't — data globals, library

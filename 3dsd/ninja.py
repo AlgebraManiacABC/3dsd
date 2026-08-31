@@ -13,6 +13,40 @@ def _escape_ninja(s: str) -> str:
     return s.replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
 
 
+def _extended_split(config: ProjectConfig, bin_name: str, sym, sym_addr: int,
+                    sym_size: int, gap_end: int):
+    """Write the comparison window for a symbol whose compiled form is longer.
+
+    armcc keeps a function's literal pool inside that function's own section,
+    while a symbol's declared size covers only its instructions -- Ghidra is
+    right about that, the pool is data. The bytes between the two are normally
+    unclaimed padding plus the pool, so the comparison is widened to cover
+    them rather than asking anyone to overstate the function's size.
+
+    Only ever widens up to the next symbol, and never past it: absorbing a
+    neighbour's bytes would be wrong. Widening can only make a comparison
+    stricter -- more bytes have to agree -- so it cannot invent a match.
+    Returns None when nothing needs to change.
+    """
+    if sym is None:
+        return None
+    compiled = config.compiled_size(bin_name, sanitize(sym.name))
+    if not compiled or compiled <= sym_size:
+        return None
+    if sym_addr + compiled > gap_end:
+        return None
+
+    from .elf import ELF
+    from .util import Symbol
+    data = config.binaries[bin_name].data[sym_addr:sym_addr + compiled]
+    name = sanitize(sym.name)
+    out = config.build_dir / bin_name / '.extents' / f'{name}.o'
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ELF.from_bytes_single(data, Symbol(sym_addr, name, sym.mode, compiled,
+                                       sym.segment)).write(out)
+    return out
+
+
 def generate_ninja(config: ProjectConfig):
     """Generate build.ninja for the project."""
     ninja_path = config.working_dir / 'build.ninja'
@@ -59,7 +93,7 @@ def generate_ninja(config: ProjectConfig):
         '  description = CC $desc',
         '',
         'rule compare',
-        '  command = $tool extract-compare --compiled $in --split $split --output $out --sym $sym --symbols $symbols --base-addr $base_addr --split-addr $split_addr',
+        '  command = $tool extract-compare --compiled $in --split $split --output $out --sym $sym --symbols $symbols --base-addr $base_addr --split-addr $split_addr $cmp_arg',
         '  description = CMP $desc',
         '',
         'rule link',
@@ -120,6 +154,7 @@ def generate_ninja(config: ProjectConfig):
                 sym_size = bin_size - cur_addr
                 sym_addr = cur_addr
                 cur_addr += sym_size
+                cur_sym, gap_end = None, 0
             elif cur_addr == addrs[addr_idx]:
                 sym = sym_dict[cur_addr]
                 sym_name = sanitize(sym.name)
@@ -130,10 +165,12 @@ def generate_ninja(config: ProjectConfig):
                     sym_size = next_addr - cur_addr
                 cur_addr += sym_size
                 addr_idx += 1
+                cur_sym, gap_end = sym, next_addr
             elif cur_addr < addrs[addr_idx]:
                 sym_name = f'{cur_addr:08x}'
                 sym_addr = cur_addr
                 cur_addr = addrs[addr_idx]
+                cur_sym, gap_end = None, 0
             else:
                 raise RuntimeError(f"Address tracking error at {cur_addr:08x}")
 
@@ -157,7 +194,17 @@ def generate_ninja(config: ProjectConfig):
                     lines.append(f'  desc = {bin_name}/{src_key}')
                     lines.append('')
 
-                lines.append(f'build {_escape_ninja(link_o)}: compare {_escape_ninja(build_o)} | {_escape_ninja(split_o)}')
+                cmp_o = _extended_split(config, bin_name, cur_sym,
+                                        sym_addr, sym_size, gap_end)
+                deps = _escape_ninja(split_o)
+                cmp_arg = ''
+                if cmp_o:
+                    rel = _rel(cmp_o)
+                    deps += ' ' + _escape_ninja(rel)
+                    cmp_arg = f'--compare-split {rel}'
+
+                lines.append(f'build {_escape_ninja(link_o)}: compare {_escape_ninja(build_o)} | {deps}')
+                lines.append(f'  cmp_arg = {cmp_arg}')
                 lines.append(f'  split = {split_o}')
                 lines.append(f'  sym = {sym_name}')
                 lines.append(f'  symbols = {sym_csv_posix}')

@@ -76,6 +76,9 @@ def main():
     p_ec.add_argument('--symbols')
     p_ec.add_argument('--base-addr', type=lambda x: int(x, 0), default=0)
     p_ec.add_argument('--split-addr', type=lambda x: int(x, 0), default=0)
+    p_ec.add_argument('--compare-split',
+                      help='Alternate reference object to compare against; the '
+                           'object written for linking still comes from --split')
 
     # --- link-base (internal, called by Ninja) ---
     p_lb = sub.add_parser('link-base', help='Link the objdiff base ELF (internal)')
@@ -160,6 +163,7 @@ def main():
                 symbols_csv=Path(args.symbols) if args.symbols else None,
                 base_addr=args.base_addr,
                 split_addr=args.split_addr,
+                compare_split=Path(args.compare_split) if args.compare_split else None,
             )
 
         case 'link-base':
