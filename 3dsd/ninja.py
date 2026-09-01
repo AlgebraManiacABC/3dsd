@@ -47,8 +47,22 @@ def _extended_split(config: ProjectConfig, bin_name: str, sym, sym_addr: int,
     return out
 
 
-def generate_ninja(config: ProjectConfig):
-    """Generate build.ninja for the project."""
+def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
+    """Generate build.ninja for the project.
+
+    By default the graph carries only what decomp progress needs: each source
+    compiled to its own object, and those objects linked into the objdiff base
+    ELF. The objdiff target is built from the original binary and the symbol
+    CSV, so nothing in the progress path needs the split.
+
+    `roundtrip` adds the byte-perfect rebuild on top -- the per-symbol compare
+    objects, the full link, the flatten/CRO step and the verify. That path
+    exercises the pipeline rather than the decomp: every object it links holds
+    original bytes, so it can only confirm that the split and the relink agree
+    with the binary they came from. It costs a split of every symbol in the
+    binary and a link of all of them (74,384 objects for ACNL's code.bin), so
+    it is opt-in.
+    """
     ninja_path = config.working_dir / 'build.ninja'
     linker_ld = Path(__file__).parent / 'linker.ld'
     wd = config.working_dir
@@ -123,7 +137,7 @@ def generate_ninja(config: ProjectConfig):
     ]
 
     default_targets = []
-    compare_targets: list[str] = []
+    compile_targets: list[str] = []
     base_elf_targets: list[str] = []
     ld_flags = '--entry=0 --no-warn-mismatch --use-blx -T $linker_ld'
 
@@ -184,6 +198,7 @@ def generate_ninja(config: ProjectConfig):
                 if src_key not in emitted_compile:
                     emitted_compile.add(src_key)
                     compiled_objects.append(build_o)
+                    compile_targets.append(build_o)
                     cc_path, flags = config.get_cc(bin_name, src_key)
                     cc_posix = _posix(cc_path.resolve())
                     flags_arg = '--flags=' + ','.join(flags) if flags else ''
@@ -193,6 +208,9 @@ def generate_ninja(config: ProjectConfig):
                     lines.append(f'  flags_arg = {flags_arg}')
                     lines.append(f'  desc = {bin_name}/{src_key}')
                     lines.append('')
+
+                if not roundtrip:
+                    continue
 
                 cmp_o = _extended_split(config, bin_name, cur_sym,
                                         sym_addr, sym_size, gap_end)
@@ -214,9 +232,21 @@ def generate_ninja(config: ProjectConfig):
                 lines.append('')
 
                 link_objects.append(link_o)
-                compare_targets.append(link_o)
-            else:
+            elif roundtrip:
                 link_objects.append(split_o)
+
+        # The objdiff base ELF is the progress path: compiled objects only.
+        base_elf = None
+        if compiled_objects:
+            base_elf = _rel(config.out_dir / 'objdiff_base' / bin_name)
+            base_obj_list = ' '.join(_escape_ninja(o) for o in compiled_objects)
+            lines.append(f'build {_escape_ninja(base_elf)}: link_base {base_obj_list}')
+            lines.append('')
+            base_elf_targets.append(base_elf)
+            default_targets.append(base_elf)
+
+        if not roundtrip:
+            continue
 
         # Link all objects (full link with linker script)
         linked = _rel(config.link_dir / f'{bin_name}_linked')
@@ -224,14 +254,6 @@ def generate_ninja(config: ProjectConfig):
         lines.append(f'build {_escape_ninja(linked)}: link {obj_list}')
         lines.append(f'  ldflags = {ld_flags}')
         lines.append('')
-
-        # Relocatable base ELF for objdiff (compiled objects only)
-        if compiled_objects:
-            base_elf = _rel(config.out_dir / 'objdiff_base' / bin_name)
-            base_obj_list = ' '.join(_escape_ninja(o) for o in compiled_objects)
-            lines.append(f'build {_escape_ninja(base_elf)}: link_base {base_obj_list}')
-            lines.append('')
-            base_elf_targets.append(base_elf)
 
         # Convert to binary
         is_cro = '.cro' in bin_name
@@ -257,12 +279,10 @@ def generate_ninja(config: ProjectConfig):
             lines.append('')
 
         default_targets.append(final_bin)
-        if compiled_objects:
-            default_targets.append(base_elf)
 
     # Phony targets
-    if compare_targets:
-        lines.append(f'build compile: phony {" ".join(_escape_ninja(t) for t in compare_targets)}')
+    if compile_targets:
+        lines.append(f'build compile: phony {" ".join(_escape_ninja(t) for t in compile_targets)}')
         lines.append('')
 
     if base_elf_targets:
@@ -275,4 +295,6 @@ def generate_ninja(config: ProjectConfig):
 
     ninja_path.write_text('\n'.join(lines))
     print(f"Generated {ninja_path}")
+    mode = 'progress + byte-perfect round-trip' if roundtrip else 'decomp progress'
+    print(f"  Targets: {mode}.")
     print(f"  Run 'ninja' to build, or 'ninja compile' to compile only.")

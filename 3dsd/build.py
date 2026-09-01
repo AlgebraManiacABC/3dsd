@@ -14,18 +14,22 @@ def _find_ninja() -> str | None:
 
 
 def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
-              targets: list[str] | None) -> bool:
+              targets: list[str] | None, roundtrip: bool = False) -> bool:
     from .config import ProjectConfig
     from .split import run_split
     from .ninja import generate_ninja
     from .objdiff import generate_objdiff, report_progress
 
     config = ProjectConfig.load(working_dir)
-    _print("=== Split ===")
-    run_split(config, progress=True)
+
+    # The split exists only to feed the round-trip: the objdiff target is cut
+    # from the original binary directly, so a progress build never reads it.
+    if roundtrip:
+        _print("=== Split ===")
+        run_split(config, progress=True)
 
     _print("=== Ninja ===")
-    generate_ninja(config)
+    generate_ninja(config, roundtrip)
 
     ninja_bin = _find_ninja()
     if not ninja_bin:

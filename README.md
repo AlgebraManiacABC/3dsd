@@ -254,16 +254,31 @@ match > `default`. The first match wins.
 python -m 3dsd build .
 ```
 
-One command does everything: splits the originals (first run only), generates
-`build.ninja` and `objdiff.json`, compiles, compares, links a byte-perfect
-binary into `out/`, and prints progress. Other commands:
+This generates `build.ninja` and `objdiff.json`, compiles every source, links
+the objdiff base ELF, and prints progress. It does not touch `split/`: the
+objdiff target is cut from the original binary and the symbol CSV, so decomp
+progress never needs the originals taken apart.
+
+```bash
+python -m 3dsd build . --roundtrip
+```
+
+adds the byte-perfect rebuild -- split every symbol, compare each decompiled
+function against its original bytes, link them all back together, and verify
+the result hashes identically to `orig/`. Every object that link consumes holds
+original bytes, so it confirms the pipeline agrees with itself rather than
+measuring the decomp; progress is the same either way. It is off by default
+because it costs a split and a link of every symbol in every binary -- for
+ACNL's `code.bin` that is 74,384 objects and a link measured in minutes, versus
+seconds for the progress path. Run it when the split, the linker script or the
+CRO rebuild changed, and in CI. Other commands:
 
 | command | purpose |
 |---|---|
 | `python -m 3dsd progress .` | progress report without building |
-| `python -m 3dsd check .`    | verify `out/` binaries match `orig/` |
+| `python -m 3dsd check .`    | verify `out/` binaries match `orig/` (needs `--roundtrip` first) |
 | `python -m 3dsd split .`    | (re)split originals into `split/` |
-| `python -m 3dsd ninja .`    | regenerate `build.ninja` only |
+| `python -m 3dsd ninja .`    | regenerate `build.ninja` only (`--roundtrip` for the full graph) |
 | `python -m 3dsd objdiff .`  | regenerate `objdiff.json` only |
 | `python -m 3dsd clean .`    | remove generated output |
 

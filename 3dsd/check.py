@@ -19,8 +19,14 @@ def check_binary(original: Path, built: Path) -> bool:
 
 
 def run_check(config: ProjectConfig) -> bool:
-    """Check all recreated binaries against originals."""
+    """Check all recreated binaries against originals.
+
+    Reports failure when nothing was checked at all. The recreated binaries
+    come from the round-trip, which a plain `3dsd build` no longer runs, so a
+    silent pass here would read as "byte-perfect" when it means "not built".
+    """
     all_ok = True
+    checked = 0
     for name in config.binaries:
         built = config.out_dir / name
         if not built.exists():
@@ -30,8 +36,13 @@ def run_check(config: ProjectConfig) -> bool:
         if not original:
             print(f"  SKIP: {name} (no original)")
             continue
+        checked += 1
         if not check_binary(original, built):
             all_ok = False
+    if not checked:
+        print(f"  Nothing to check: no recreated binaries in {config.out_dir.name}/.")
+        print("  Run '3dsd build --roundtrip' to split, relink and verify.")
+        return False
     return all_ok
 
 

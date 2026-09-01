@@ -22,6 +22,9 @@ def main():
     p_ninja.add_argument('dir', help='Project working directory')
     p_ninja.add_argument('--single-binary', metavar='NAME',
                          help='Operate on only this binary')
+    p_ninja.add_argument('--roundtrip', action='store_true',
+                         help='Also emit the byte-perfect rebuild (split, '
+                              'compare, link, verify)')
 
     # --- objdiff ---
     p_objdiff = sub.add_parser('objdiff', help='Generate objdiff.json')
@@ -36,6 +39,11 @@ def main():
                          help='Number of parallel jobs')
     p_build.add_argument('-k', '--keep-going', action='store_true',
                          help='Keep going on errors')
+    p_build.add_argument('--roundtrip', action='store_true',
+                         help='Also split and relink the originals, verifying '
+                              'the rebuild is byte-perfect. Off by default: it '
+                              'tests the pipeline, not the decomp, and costs a '
+                              'split and link of every symbol in every binary')
     p_build.add_argument('targets', nargs='*', default=None,
                          help='Ninja targets (e.g. "compile")')
 
@@ -112,7 +120,7 @@ def main():
             from .config import ProjectConfig
             from .ninja import generate_ninja
             config = ProjectConfig.load(Path(args.dir), args.single_binary)
-            generate_ninja(config)
+            generate_ninja(config, args.roundtrip)
 
         case 'objdiff':
             from .config import ProjectConfig
@@ -122,7 +130,8 @@ def main():
 
         case 'build':
             from .build import run_build
-            ok = run_build(Path(args.dir), args.jobs, args.keep_going, args.targets)
+            ok = run_build(Path(args.dir), args.jobs, args.keep_going,
+                           args.targets, args.roundtrip)
             sys.exit(0 if ok else 1)
 
         case 'check':
