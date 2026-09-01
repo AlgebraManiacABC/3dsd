@@ -29,6 +29,7 @@ myproject/
 ├── symbols/        one CSV per binary: code.bin.csv, ModuleX.cro.csv ...
 ├── src/
 │   └── code.bin/   sources for that binary (any folder structure below)
+├── include/        optional; added as -Iinclude to every source
 ├── deps/           referenced external source trees, one directory each
 ├── tools/          ld, objcopy (optionally objdiff-cli, armcc installs)
 └── cc.yaml         compiler configuration
@@ -44,6 +45,13 @@ Everything else is generated and safe to delete (see `clean` below):
 ├── build.ninja     generated build graph
 └── objdiff.json    generated objdiff project
 ```
+
+A top-level `include/` directory, if present, is added as `-Iinclude` to every
+source in the project, ahead of any dependency or toolchain headers. Reconstructed
+types belong there and are reachable as `#include "types.h"` from any depth,
+rather than each file counting directories back to them. Nothing breaks if you
+already list it in `flags:` -- it is not added twice -- and a project without the
+directory is unaffected.
 
 Symbol CSVs have the header `Location,Name,Mode,Size,Segment`, e.g.
 `00100000,Entry,$a,00000002,".text"` (`$a` = ARM, `$t` = Thumb; hex sizes).

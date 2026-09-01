@@ -19,6 +19,7 @@ SPLIT_DIR = 'split'
 LINK_DIR = 'link'
 OUT_DIR = 'out'
 SYMBOLS_DIR = 'symbols'
+INCLUDE_DIR = 'include'
 
 # Referenced dependencies live at deps/<name>, and their sources are keyed
 # under this prefix so they cannot collide with a path under src/<binary>/.
@@ -197,6 +198,17 @@ class ProjectConfig:
             raise Exception(f"No compiler config for {source_name} and no default!")
         cc_name = d['cc']
         flags = list(d.get('flags', []))
+
+        # The project's own include/ is on the search path for every source,
+        # ahead of any dependency or toolchain headers. A decomp keeps its
+        # reconstructed types there, and without this each file had to count
+        # directories back to it -- `#include "../../../include/types.h"` --
+        # which encodes a file's location in its contents and breaks the
+        # moment the file moves. Project-relative, because both compile paths
+        # run with the project as their working directory.
+        project_include = f'-I{INCLUDE_DIR}'
+        if (self.working_dir / INCLUDE_DIR).is_dir() and project_include not in flags:
+            flags.append(project_include)
 
         # Every source built for this binary can include the headers of every
         # dependency the binary declares, so game code reaches its headers and
