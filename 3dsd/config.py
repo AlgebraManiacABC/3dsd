@@ -204,10 +204,8 @@ class ProjectConfig:
             install = Path(self.compilers[cc_name])
             if not install.is_absolute():
                 install = self.working_dir / install
-            cc = install / 'bin' / 'armcc.exe'
-            if not cc.exists():
-                cc = install / 'bin' / 'armcc'
-            if not cc.exists():
+            cc = _find_executable(install / 'bin' / 'armcc')
+            if cc is None:
                 raise Exception(
                     f"Compiler '{cc_name}': no armcc executable found under {install.resolve() / 'bin'}")
             include = install / 'include'
@@ -217,10 +215,8 @@ class ProjectConfig:
             cc = self.tool_dir / cc_name
             if cc.is_dir():
                 install = cc
-                cc = install / 'bin' / 'armcc.exe'
-                if not cc.exists():
-                    cc = install / 'bin' / 'armcc'
-                if not cc.exists():
+                cc = _find_executable(install / 'bin' / 'armcc')
+                if cc is None:
                     raise Exception(
                         f"Compiler '{cc_name}': no armcc executable in {install.resolve() / 'bin'}")
                 include = install / 'include'
@@ -559,7 +555,7 @@ def _binary_deps(cc_info: dict, bin_name: str,
 
 
 def _find_executable(path: Path) -> Path | None:
-    """Locate a tools/ executable given the bare name from cc.yaml.
+    """Locate an executable given its extensionless path.
 
     Not `with_suffix('.exe')`: every armcc name carries dots, so
     `armcc_4.1_894` would be read as stem `armcc_4` plus extension `.1_894`
@@ -567,7 +563,12 @@ def _find_executable(path: Path) -> Path | None:
 
     Toolchains are often shipped with both a Windows and an extensionless
     Unix binary side by side, so the platform decides which one wins rather
-    than whichever happens to be tested first.
+    than whichever happens to be tested first. That matters most on Linux,
+    where the extensionless file is frequently a wrapper running the .exe
+    under wibo or wine: picking the .exe there hands subprocess a PE and
+    fails with "Exec format error". Every compiler lookup goes through here
+    -- an install root's bin/armcc as much as a bare name in tools/ -- so
+    one rule covers all three forms cc.yaml accepts.
     """
     exe = path.with_name(path.name + '.exe')
     order = (exe, path) if os.name == 'nt' else (path, exe)
