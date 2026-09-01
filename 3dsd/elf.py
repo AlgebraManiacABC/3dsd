@@ -484,7 +484,15 @@ _SECTION_FLAGS = {
 
 
 def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
-    """Write a relocatable ELF with per-segment sections for objdiff targets."""
+    """Write a relocatable ELF with per-segment sections for objdiff targets.
+
+    Symbols in the `std` namespace are written as bytes but left unnamed: the
+    section still carries them, so every following symbol keeps its address,
+    while objdiff -- which measures per symbol -- sees nothing there and drops
+    the range from total_code, total_functions and total_data alike. The
+    `$a`/`$t`/`$d` mapping symbols stay, so the disassembler does not lose
+    track of ARM/Thumb state across a discounted region.
+    """
     # Group symbols into contiguous segment runs
     sections = []  # (name, start, end)
     if not sym_list:
@@ -523,6 +531,8 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
         sym_type = 0x12 if is_code else 0x11  # STT_FUNC / STT_OBJECT
         local_syms.append(SymbolTableEntry(len(local_strtab), sym_value, 0, 0x0, 0x0, shndx))
         local_strtab += sym.mode.encode('utf-8') + b'\x00'
+        if sym.is_stdlib:
+            continue  # library code: leave these bytes unlabelled
         global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, sym.size, sym_type, 0, shndx))
         global_strtab += sym.name.encode('utf-8') + b'\x00'
     for g_sym in global_syms:

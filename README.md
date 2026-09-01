@@ -48,6 +48,17 @@ Everything else is generated and safe to delete (see `clean` below):
 Symbol CSVs have the header `Location,Name,Mode,Size,Segment`, e.g.
 `00100000,Entry,$a,00000002,".text"` (`$a` = ARM, `$t` = Thumb; hex sizes).
 
+An optional `Namespace` column may follow `Name`
+(`Location,Name,Namespace,Mode,Size,Segment`). Anything whose namespace is
+`std` or starts with `std::` is treated as C++ standard library code linked in
+from a `.a` rather than written by the original developers: its bytes are
+written into the objdiff target but left without a symbol, so they drop out of
+`total_code` and the function count and no longer weigh down the completion
+percentage. The split and the relink are unaffected — the final binary is
+still byte-perfect. Note that objdiff measures data by section size, so
+discounting only moves the code figures; `std` entries in `.rodata` still show
+up in the data total.
+
 ## Compiler & tools setup
 
 The pipeline needs two things in addition to your sources and symbols:

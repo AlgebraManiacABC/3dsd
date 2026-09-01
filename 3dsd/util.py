@@ -96,12 +96,26 @@ class WritableBytes(bytes):
 
 
 class Symbol:
-    def __init__(self, addr: int, name: str, mode: str, size: int, segment: str):
+    def __init__(self, addr: int, name: str, mode: str, size: int, segment: str,
+                 namespace: str = ''):
         self.addr = addr
         self.name = name
         self.mode = mode
         self.size = size
         self.segment = segment
+        self.namespace = namespace
+
+    @property
+    def is_stdlib(self) -> bool:
+        """True for anything in the C++ `std` namespace.
+
+        These come out of the toolchain's `.a` files rather than the game's
+        own source, so they are excluded from the objdiff target: nobody is
+        going to decompile them, and counting them only deflates the
+        completion percentage. The bytes still exist in the split, so the
+        relinked binary stays byte-perfect either way.
+        """
+        return self.namespace == 'std' or self.namespace.startswith('std::')
 
 
 class RelocationType(IntEnum):

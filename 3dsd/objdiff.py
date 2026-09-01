@@ -12,28 +12,44 @@ from .util import Symbol
 
 
 def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
-    """Return a symbol list covering every byte, filling gaps with synthetics."""
+    """Return a symbol list covering every byte, filling gaps with synthetics.
+
+    Gaps that sit between two `std` symbols inherit the `std` namespace: the
+    inter-function alignment padding inside a library region came in from the
+    same `.a`, so it is discounted along with the functions around it.
+    """
     sym_dict = {sym.addr: sym for sym in symbols if 0 <= sym.addr < bin_size}
     addrs = sorted(sym_dict.keys())
     result = []
     cur = 0
     idx = 0
     last_segment = '.text'
+    last_stdlib = False
+
+    def gap_namespace(next_idx: int) -> str:
+        """`std` only if the symbols on both sides of the gap are std ones."""
+        if not last_stdlib or next_idx >= len(addrs):
+            return ''
+        return 'std' if sym_dict[addrs[next_idx]].is_stdlib else ''
 
     while idx < len(addrs) or cur < bin_size:
         if idx >= len(addrs):
-            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', bin_size - cur, last_segment))
+            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', bin_size - cur,
+                                 last_segment, gap_namespace(idx)))
             break
         elif cur == addrs[idx]:
             sym = sym_dict[cur]
             next_addr = addrs[idx + 1] if idx + 1 < len(addrs) else bin_size
             size = min(sym.size, next_addr - cur)
-            result.append(Symbol(cur, sym.name, sym.mode, size, sym.segment))
+            result.append(Symbol(cur, sym.name, sym.mode, size, sym.segment,
+                                 sym.namespace))
             last_segment = sym.segment
+            last_stdlib = sym.is_stdlib
             cur += size
             idx += 1
         elif cur < addrs[idx]:
-            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', addrs[idx] - cur, last_segment))
+            result.append(Symbol(cur, f'pad_{cur:08x}', '$a', addrs[idx] - cur,
+                                 last_segment, gap_namespace(idx)))
             cur = addrs[idx]
         else:
             raise RuntimeError(f"Address tracking error at {cur:08x}")
@@ -50,7 +66,10 @@ def generate_target_elfs(config: ProjectConfig):
         syms = _complete_symbols(config.symbols.get(name, []), len(data))
         out = target_dir / name
         write_target_elf(out, data, syms)
-        print(f"  {name}: {len(data):,} bytes, {len(syms)} symbols -> {out}")
+        std_bytes = sum(s.size for s in syms if s.is_stdlib)
+        labelled = len(syms) - sum(1 for s in syms if s.is_stdlib)
+        note = f", {std_bytes:,} std bytes discounted" if std_bytes else ""
+        print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note} -> {out}")
 
 
 def generate_objdiff(config: ProjectConfig):

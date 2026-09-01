@@ -630,7 +630,9 @@ def _gather_symbols(sym_path: Path) -> list[Symbol]:
         try:
             symbols.append(Symbol(
                 int(line["Location"], 16), line["Name"],
-                line["Mode"], int(line["Size"], 16), line["Segment"]
+                line["Mode"], int(line["Size"], 16), line["Segment"],
+                # Optional: older CSV exports have no Namespace column.
+                (line.get("Namespace") or '').strip()
             ))
         except (ValueError, KeyError):
             pass
