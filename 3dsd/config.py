@@ -99,6 +99,16 @@ class ProjectConfig:
 
     @classmethod
     def load(cls, working_dir: Path, single_binary: str = None) -> "ProjectConfig":
+        # Anchor the project absolutely before deriving anything from it. Two
+        # different relative bases otherwise collide: paths built here are
+        # relative to the caller's cwd, but the compile runs with cwd set to
+        # the project (ninja's own directory, matched by section discovery so
+        # `-Iinclude` resolves the same way). A relative `3dsd build
+        # versions/X` therefore handed subprocess a compiler path that only
+        # existed one directory up -- ENOENT on a file the pipeline had just
+        # confirmed. The ninja generator re-relativises for build.ninja, so
+        # what lands in the build graph is unchanged.
+        working_dir = working_dir.resolve()
         orig_dir = working_dir / 'orig'
         source_dir = working_dir / 'src'
         build_dir = working_dir / BUILD_DIR
