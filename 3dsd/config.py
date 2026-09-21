@@ -298,6 +298,28 @@ class ProjectConfig:
         """
         return self.build_dir / bin_name / f'{src_key}.o'
 
+    def get_decompiled_data(self, bin_name: str) -> set[str]:
+        """Return the names of data objects this project's sources define.
+
+        Read from the same cached discovery objects `get_source_map` uses, so
+        it costs nothing extra; it just keeps the sections `discover_sections`
+        throws in with the functions and that `base.ld` routes away from .text.
+
+        A name in here means "we compiled this data object from source". Cross
+        it with the symbol CSV -- which says where the original keeps it -- and
+        the intersection is the data worth comparing. Anything the compiler
+        invented (string literals, vtables, `__ARM_common_*` helpers) is absent
+        from the CSV, and anything still undecompiled is absent from here.
+        """
+        from .compare import discover_data_sections
+
+        names: set[str] = set()
+        for src in self.sources.get(bin_name, []):
+            build_o = self.obj_path(bin_name, self.src_key(bin_name, src))
+            if build_o.exists() and build_o.stat().st_size > 0:
+                names.update(sanitize(s) for s in discover_data_sections(build_o))
+        return names
+
     def get_source_map(self, bin_name: str) -> dict[str, tuple[Path, str]]:
         """Return {sym_name: (source_path, src_key)} for every symbol a source
         provides.

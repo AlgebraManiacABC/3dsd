@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import ProjectConfig
 from .elf import write_target_elf
-from .util import Symbol
+from .util import Symbol, sanitize
 
 
 def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
@@ -57,13 +57,70 @@ def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
     return result
 
 
+#: Segments whose symbols objdiff can meaningfully diff against a compiled base.
+DATA_SEGMENTS = ('.rodata', '.data')
+
+#: Where undecompiled data goes. The base ELF never has a section by this name,
+#: so objdiff pairs nothing and never diffs these bytes. That matters more than
+#: it sounds: objdiff's data diff is quadratic in section length -- measured at
+#: 0.3 s for 8 KB, 51 s for 128 KB, 210 s for 256 KB -- so leaving New Leaf's
+#: whole 1.13 MB .rodata paired costs over an hour, while the few KB actually
+#: decompiled costs milliseconds. Unnaming the symbols (as `std` does) would
+#: fix the percentages but not the cost, because the bytes would still be in
+#: the paired section.
+#:
+#: The name deliberately is not `.rodata.something`: objdiff folds a dotted
+#: suffix back into its parent section, the way `-ffunction-sections` output is
+#: meant to be read, so `.rodata.undecompiled` was silently counted as .rodata
+#: and diffed anyway. It has to be a section name of its own, matching the
+#: invented `.rwdata` that `base.ld` already relies on.
+SKIP_SEGMENT = '.undecompiled'
+
+
+def _route_data(symbols: list[Symbol], decompiled: set[str]) -> list[Symbol]:
+    """Move data symbols we have not decompiled into a non-pairing segment.
+
+    Applied before the gaps are filled, so the padding between two undecompiled
+    data objects inherits the skipped segment too and stays out of the diff.
+    """
+    out = []
+    for sym in symbols:
+        if sym.segment in DATA_SEGMENTS and sanitize(sym.name) not in decompiled:
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
+                              SKIP_SEGMENT, sym.namespace))
+        else:
+            out.append(sym)
+    return out
+
+
+def _skip_data_padding(symbols: list[Symbol]) -> list[Symbol]:
+    """Keep gap filler out of the paired data sections.
+
+    A gap inherits the segment of the symbol before it, so one decompiled table
+    near the start of the data region would drag every following unnamed byte
+    into `.rodata` -- on ikachan that is 203,776 bytes of padding, which is the
+    quadratic cost this whole arrangement exists to avoid. Padding is by
+    definition not decompiled, so it belongs with the rest of the skipped data.
+    """
+    out = []
+    for sym in symbols:
+        if sym.segment in DATA_SEGMENTS and sym.name.startswith('pad_'):
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
+                              SKIP_SEGMENT, sym.namespace))
+        else:
+            out.append(sym)
+    return out
+
+
 def generate_target_elfs(config: ProjectConfig):
     """Wrap each original binary as an ELF with symbols from the CSV."""
     target_dir = config.out_dir / 'objdiff_target'
     target_dir.mkdir(parents=True, exist_ok=True)
     for name in config.binaries:
         data = config.binaries[name].data
-        syms = _complete_symbols(config.symbols.get(name, []), len(data))
+        decompiled = config.get_decompiled_data(name)
+        raw = _route_data(config.symbols.get(name, []), decompiled)
+        syms = _skip_data_padding(_complete_symbols(raw, len(data)))
         out = target_dir / name
         write_target_elf(out, data, syms)
         std_bytes = sum(s.size for s in syms if s.is_stdlib)

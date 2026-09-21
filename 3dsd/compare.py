@@ -123,6 +123,55 @@ def discover_sections(obj_path: Path) -> list[str]:
     return names
 
 
+def discover_data_sections(obj_path: Path) -> list[str]:
+    """Return the `i.NAME`/`t.NAME` symbols that hold data rather than code.
+
+    Same sections `discover_sections` walks, split the way `base.ld` splits
+    them: by flags, not by name. armcc gives a data object its own `i.NAME`
+    section exactly as it does a function, so `i.png_sig_cmp` (AX) and
+    `i.png_libpng_ver` (WA) are indistinguishable until you read SHF_EXECINSTR.
+
+    What comes back is "data this source deliberately defines", which is the
+    base half of deciding whether a data symbol was decompiled on purpose --
+    the other half being whether the symbol CSV knows where it lives in the
+    original.
+    """
+    try:
+        data = obj_path.read_bytes()
+    except (OSError, ValueError):
+        return []
+    if len(data) < 0x34 or data[:4] != b'\x7fELF':
+        return []
+
+    reader = BinaryReader(obj_path.name, data)
+    reader.seek(0x20)
+    shoff = reader.read_u32()
+    reader.seek(0x30)
+    shnum = reader.read_u16()
+    shstrndx = reader.read_u16()
+    if shstrndx >= shnum:
+        return []
+
+    reader.seek(shoff + 0x28 * shstrndx + 0x10)
+    shstrtab_off = reader.read_u32()
+    reader.seek(shoff + 0x28 * shstrndx + 0x14)
+    shstrtab_size = reader.read_u32()
+    reader.seek(shstrtab_off)
+    shstrtab = reader.read_bytes(shstrtab_size)
+
+    SHF_EXECINSTR = 0x4
+    names = []
+    for i in range(shnum):
+        reader.seek(shoff + 0x28 * i)
+        name_off = reader.read_u32()
+        reader.seek(shoff + 0x28 * i + 0x08)
+        flags = reader.read_u32()
+        name = get_name(shstrtab, name_off) if name_off < len(shstrtab) else ''
+        if name.startswith(('i.', 't.')) and not flags & SHF_EXECINSTR:
+            names.append(name[2:])
+    return names
+
+
 def discover_section_sizes(obj_path: Path) -> dict[str, int]:
     """Byte size of each `i.NAME`/`t.NAME` section, plus `.text`, by symbol.
 
