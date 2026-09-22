@@ -91,10 +91,16 @@ class SymbolInfo:
     declared, and `extent` is how far it reaches before the next symbol in the
     same section -- longer than `size` whenever a literal pool or alignment
     padding follows, which is what the comparison window has to cover.
+
+    `vague` marks a definition C++ expects to appear in every translation unit
+    that needs it -- a vtable, an RTTI record, a template instantiation, an
+    inline function -- and which the linker folds down to one copy. Several
+    sources defining it is the language working as specified, not a conflict.
     """
     segment: str
     size: int
     extent: int
+    vague: bool = False
 
 
 def discover_symbols(obj_path: Path) -> dict[str, SymbolInfo]:
@@ -140,6 +146,8 @@ def discover_symbols(obj_path: Path) -> dict[str, SymbolInfo]:
 
     SHT_SYMTAB = 2
     SHT_NOBITS = 8
+    SHT_GROUP = 17
+    GRP_COMDAT = 0x1
     SHF_WRITE = 0x1
     SHF_ALLOC = 0x2
     SHF_EXECINSTR = 0x4
@@ -162,6 +170,21 @@ def discover_symbols(obj_path: Path) -> dict[str, SymbolInfo]:
 
     if symtab is None:
         return {}
+
+    # A vague-linkage definition goes in its own COMDAT group so the linker can
+    # keep one copy and drop the rest. The group is the only honest signal that
+    # a repeated definition is expected: armcc gives `_ZTV7UtlBaseI9DemoActorE`
+    # STB_GLOBAL binding, indistinguishable from a strong definition, and marks
+    # only the section it lives in.
+    comdat: set[int] = set()
+    for sec_type, _flags, off, size, _link in sections:
+        if sec_type != SHT_GROUP or size < 8:
+            continue
+        reader.seek(off)
+        if reader.read_u32() & GRP_COMDAT:
+            for _ in range(size // 4 - 1):
+                comdat.add(reader.read_u32())
+
     _, sym_off, sym_size, strtab_idx = symtab
     if strtab_idx >= shnum:
         return {}
@@ -209,7 +232,8 @@ def discover_symbols(obj_path: Path) -> dict[str, SymbolInfo]:
         entries.sort()
         for idx, (value, name, size) in enumerate(entries):
             end = entries[idx + 1][0] if idx + 1 < len(entries) else sec_size
-            found[name] = SymbolInfo(segment, size, max(end - value, size))
+            found[name] = SymbolInfo(segment, size, max(end - value, size),
+                                     shndx in comdat)
     return found
 
 
