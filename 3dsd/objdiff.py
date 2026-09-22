@@ -77,19 +77,26 @@ DATA_SEGMENTS = ('.rodata', '.data')
 SKIP_SEGMENT = '.undecompiled'
 
 
-def _route_data(symbols: list[Symbol], decompiled: set[str]) -> list[Symbol]:
-    """Move data symbols we have not decompiled into a non-pairing segment.
+def _route_data(symbols: list[Symbol], decompiled: dict[str, str]) -> list[Symbol]:
+    """Send each data symbol to the section that lets it pair, or out of the way.
+
+    A decompiled object takes the section armcc put the base's copy in, not the
+    one the CSV names. objdiff pairs within a section, and the two disagree
+    often: whether a table is `const` decides `.rodata` against `.data`, and an
+    export has no way to know. Following the CSV instead would leave the halves
+    in different sections, pairing nothing while looking entirely healthy.
 
     Applied before the gaps are filled, so the padding between two undecompiled
     data objects inherits the skipped segment too and stays out of the diff.
     """
     out = []
     for sym in symbols:
-        if sym.segment in DATA_SEGMENTS and sanitize(sym.name) not in decompiled:
-            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
-                              SKIP_SEGMENT, sym.namespace))
-        else:
+        if sym.segment not in DATA_SEGMENTS:
             out.append(sym)
+            continue
+        section = decompiled.get(sanitize(sym.name), SKIP_SEGMENT)
+        out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
+                          section, sym.namespace))
     return out
 
 
@@ -163,8 +170,8 @@ def generate_objdiff(config: ProjectConfig):
     print(f"Generated {out_path}")
 
 
-_COLUMNS = ('Binary', 'Code bytes', 'Code %', 'Fuzzy %',
-            'Functions 100%', 'Func %', 'Data bytes', 'Total bytes', 'Total %')
+_COLUMNS = ('Binary', 'Code bytes', 'Code %', 'Fuzzy Code %',
+            'Data bytes', 'Data %', 'Fuzzy Data %', 'Total bytes', 'Total %')
 
 
 _RATIO = 'r'   # cell holding "numerator / denominator"
@@ -182,47 +189,78 @@ def _ratio(num: str, den: str, tint: float | None) -> tuple:
     return (_RATIO, num, den, tint)
 
 
-def measure_row(measures: dict, label: str) -> list[tuple]:
+def data_fuzzy_percent(sections: list[dict], total_data: int) -> float | None:
+    """Size-weighted mean of the fuzzy percent over the data sections.
+
+    objdiff reports no fuzzy figure for data: `fuzzy_match_percent` in the
+    measures covers code only, because report generation `continue`s on a data
+    section before reaching the per-symbol loop that accumulates it. The
+    per-section percentages are reported though, so the data equivalent is
+    their weighted mean -- which is what `matched_data` deliberately is not.
+    `matched_data` credits a section only at exactly 100%, so a section one
+    symbol short contributes nothing; this says how far along it is.
+
+    "Data" here is every section that is not code, which for our synthesized
+    targets means .rodata, .data and whatever the undecompiled remainder is
+    routed to. The sizes are checked against objdiff's own `total_data` and
+    None is returned when they disagree, rather than reporting a percentage of
+    the wrong denominator.
+    """
+    weighted = 0.0
+    size = 0
+    for section in sections:
+        if str(section.get('name', '')).startswith('.text'):
+            continue
+        sec_size = int(section.get('size', 0))
+        weighted += float(section.get('fuzzy_match_percent', 0.0)) * sec_size
+        size += sec_size
+    if not size or (total_data and size != total_data):
+        return None
+    return weighted / size
+
+
+def measure_row(measures: dict, label: str,
+                sections: list[dict] | None = None) -> list[tuple]:
     """Render one objdiff measures block as a row of table cells.
 
-    Percentages follow objdiff: code is a fraction of total_code, not of the
-    whole binary. The total column spans code + data, and only counts matched
-    data when objdiff actually reports it.
+    Percentages follow objdiff: code is a fraction of total_code and data of
+    total_data, neither of the whole binary. Both get a strict column (bytes
+    that match exactly) and a fuzzy one (how close everything is). The total
+    column spans code + data, and only counts matched data when objdiff
+    actually reports it.
     """
     tc = int(measures.get('total_code', 0))
     mc = int(measures.get('matched_code', 0))
     code_pct = float(measures.get('matched_code_percent', 0.0))
     fuzzy_pct = float(measures.get('fuzzy_match_percent', 0.0))
-    tf = int(measures.get('total_functions', 0))
-    mf = int(measures.get('matched_functions', 0))
     td = int(measures.get('total_data', 0))
 
-    has_md = 'matched_data' in measures
-    md = int(measures['matched_data']) if has_md else 0
+    # A zero matched_data is absent from the JSON rather than present as 0:
+    # the report is a protobuf, and proto3 omits default-valued fields. So an
+    # absent field means none of the data matches, not that it went unmeasured
+    # -- reporting it as '-' understated a real 0.0000%.
+    md = int(measures.get('matched_data', 0))
+    data_pct = float(measures.get('matched_data_percent', 0.0))
+    data_fuzzy = data_fuzzy_percent(sections or [], td)
 
     code_f = (mc / tc) if tc else None
-    func_f = (mf / tf) if tf else None
+    data_f = (md / td) if td else None
     grand_total = tc + td
     grand_matched = mc + md  # md is 0 unless objdiff measured it
     grand_f = (grand_matched / grand_total) if grand_total else None
 
-    if td and has_md:
-        data_cell = _ratio(f'{md:,}', f'{td:,}', md / td)
-    elif td:
-        # Only a size: objdiff reported no matched-data figure to colour.
-        data_cell = _text(f'{td:,}')
-    else:
-        data_cell = _text('-')
+    data_cell = (_ratio(f'{md:,}', f'{td:,}', data_f) if td else _text('-'))
 
     return [
         _text(label),
         _ratio(f'{mc:,}', f'{tc:,}', code_f) if tc else _text('-'),
         _text(f'{code_pct:.4f}%', code_f) if tc else _text('-'),
         _text(f'{fuzzy_pct:.4f}%', fuzzy_pct / 100) if tc else _text('-'),
-        _ratio(f'{mf:,}', f'{tf:,}', func_f) if tf else _text('-'),
-        _text(f'{mf / tf * 100:.2f}%', func_f) if tf else _text('-'),
         data_cell,
-        _ratio(f'{grand_matched:,}', f'{grand_total:,}', grand_f) if grand_total else _text('-'),
+        _text(f'{data_pct:.4f}%', data_f) if td else _text('-'),
+        _text(f'{data_fuzzy:.4f}%', data_fuzzy / 100)
+        if data_fuzzy is not None else _text('-'),
+        _text(f'{grand_total:,}') if grand_total else _text('-'),
         _text(f'{grand_f * 100:.4f}%', grand_f) if grand_total else _text('-'),
     ]
 
@@ -366,8 +404,14 @@ def report_progress(config: ProjectConfig):
         return
 
     units = report.get('units', [])
-    rows = [measure_row(u.get('measures', {}), u.get('name', '?')) for u in units]
-    total = measure_row(report.get('measures', {}), 'Total') if len(units) > 1 else None
+    rows = [measure_row(u.get('measures', {}), u.get('name', '?'),
+                        u.get('sections', [])) for u in units]
+    # The report's own measures block carries no sections, so the total row
+    # gets every unit's pooled -- the weighted mean over all of them is the
+    # same calculation at a larger scale.
+    all_sections = [s for u in units for s in u.get('sections', [])]
+    total = (measure_row(report.get('measures', {}), 'Total', all_sections)
+             if len(units) > 1 else None)
     print(format_table(rows, total))
 
 

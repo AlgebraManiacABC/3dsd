@@ -19,9 +19,13 @@
  * decompiled into a `.rodata.undecompiled` section, which nothing here emits
  * and objdiff therefore never pairs or diffs.
  *
- * Writable data keeps the invented `.rwdata` name and still pairs with
- * nothing. It is carried through regardless, because .text relocations refer
- * to these symbols and objdiff needs them to name what a load is reading.
+ * Writable data goes to .data on the same terms. Most decompiled data is
+ * writable rather than const -- on ikachan 90 of 110 objects, including the
+ * game's own rcNpc tables -- so leaving it unpairable would have hidden nearly
+ * all of it. Zero-initialised data stays in the invented `.rwdata`: it has no
+ * bytes to compare, and pairing it would only add length to a quadratic diff.
+ * It is carried through regardless, because .text relocations refer to these
+ * symbols and objdiff needs them to name what a load is reading.
  *
  * Debug and unwind data is dropped; it would only add sections the target
  * cannot pair with.
@@ -37,10 +41,14 @@ SECTIONS
     INPUT_SECTION_FLAGS (!SHF_WRITE & !SHF_EXECINSTR) *(i.* t.*)
     *(.constdata* .conststring* .rodata*)
   }
-  .rwdata 0 :
+  .data 0 :
   {
     INPUT_SECTION_FLAGS (SHF_WRITE) *(i.* t.*)
-    *(.data* .bss* .zi*)
+    *(.data*)
+  }
+  .rwdata 0 :
+  {
+    *(.bss* .zi*)
   }
   /DISCARD/ :
   {

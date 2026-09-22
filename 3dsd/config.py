@@ -94,9 +94,11 @@ class ProjectConfig:
         self.compilers = compilers or {}
         self.deps = deps or {}
         self._verified_ccs: set[str] = set()
-        # {binary: {symbol: compiled section length}}, filled by get_source_map
-        # and read by the ninja generator to size the comparison window.
+        # {binary: {symbol: compiled extent}}, filled by get_source_map and
+        # read by the ninja generator to size the comparison window.
         self._compiled_sizes: dict[str, dict[str, int]] = {}
+        # {binary: {src_key: {symbol: SymbolInfo}}}, one parse per object.
+        self._symbol_info: dict[str, dict[str, dict]] = {}
 
     @classmethod
     def load(cls, working_dir: Path, single_binary: str = None) -> "ProjectConfig":
@@ -298,12 +300,12 @@ class ProjectConfig:
         """
         return self.build_dir / bin_name / f'{src_key}.o'
 
-    def get_decompiled_data(self, bin_name: str) -> set[str]:
-        """Return the names of data objects this project's sources define.
+    def get_decompiled_data(self, bin_name: str) -> dict[str, str]:
+        """Map data objects this project's sources define to their section.
 
         Read from the same cached discovery objects `get_source_map` uses, so
-        it costs nothing extra; it just keeps the sections `discover_sections`
-        throws in with the functions and that `base.ld` routes away from .text.
+        it costs nothing extra; it just keeps the data symbols the walk turns
+        up alongside the functions, which `base.ld` routes away from .text.
 
         A name in here means "we compiled this data object from source". Cross
         it with the symbol CSV -- which says where the original keeps it -- and
@@ -311,27 +313,46 @@ class ProjectConfig:
         invented (string literals, vtables, `__ARM_common_*` helpers) is absent
         from the CSV, and anything still undecompiled is absent from here.
         """
-        from .compare import discover_data_sections
+        found: dict[str, str] = {}
+        for symbols in self._discovered_symbols(bin_name).values():
+            for name, info in symbols.items():
+                if info.segment != '.text':
+                    found[sanitize(name)] = info.segment
+        return found
 
-        names: set[str] = set()
+    def _discovered_symbols(self, bin_name: str) -> dict[str, dict]:
+        """`{src_key: {symbol: SymbolInfo}}` for every object already compiled.
+
+        Cached because `get_source_map` and `get_decompiled_data` both want it
+        and each object is worth parsing once per run. Objects that do not
+        exist yet are simply absent: this never compiles anything, it only
+        reads what the discovery pass in `get_source_map` has already built.
+        """
+        from .compare import discover_symbols
+
+        cached = self._symbol_info.get(bin_name)
+        if cached is not None:
+            return cached
+        cached = {}
         for src in self.sources.get(bin_name, []):
-            build_o = self.obj_path(bin_name, self.src_key(bin_name, src))
+            key = self.src_key(bin_name, src)
+            build_o = self.obj_path(bin_name, key)
             if build_o.exists() and build_o.stat().st_size > 0:
-                names.update(sanitize(s) for s in discover_data_sections(build_o))
-        return names
+                cached[key] = discover_symbols(build_o)
+        self._symbol_info[bin_name] = cached
+        return cached
 
     def get_source_map(self, bin_name: str) -> dict[str, tuple[Path, str]]:
         """Return {sym_name: (source_path, src_key)} for every symbol a source
         provides.
 
-        Every source is compiled once and scanned for the `i.NAME` sections
-        armcc emits under --split_sections, so a symbol is claimed no matter
-        whether it sits alone in a file named after it, among a hundred others
-        in one translation unit, or in a C++ file under a mangled name. Objects
-        are cached in `build/`; only a missing, stale or differently-configured
-        object is recompiled.
+        Every source is compiled once and its symbol table read, so a symbol is
+        claimed no matter whether it sits alone in a file named after it, among
+        a hundred others in one translation unit, or in a C++ file under a
+        mangled name. Objects are cached in `build/`; only a missing, stale or
+        differently-configured object is recompiled.
         """
-        from .compare import compile_source, discover_sections, discover_section_sizes
+        from .compare import compile_source
 
         sources = {self.src_key(bin_name, s): s
                    for s in self.sources.get(bin_name, [])}
@@ -373,28 +394,27 @@ class ProjectConfig:
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text(json.dumps(manifest, indent=1))
 
+        # Objects have just been brought up to date, so this is the parse.
+        # Anything absent from it failed to compile: the file can still claim
+        # the symbol it is named after below, so the symbol stays in the build
+        # and simply reads as unmatched.
+        symbols_by_key = self._discovered_symbols(bin_name)
+
         discovered: dict[str, list[str]] = {}
         sizes_by_key: dict[str, dict[str, int]] = {}
         for key in sorted(sources):
+            info = symbols_by_key.get(key, {})
+            sizes_by_key[key] = {sanitize(n): i.extent for n, i in info.items()}
+            discovered[key] = [sanitize(n) for n in info]
+            # A dependency file contributing nothing is normal -- a game uses
+            # a fraction of a shared library, and plenty of it compiles away
+            # entirely behind #ifdefs. Only the project's own sources are
+            # worth warning about; dependencies get a summary instead.
             build_o = self.obj_path(bin_name, key)
-            sizes_by_key[key] = discover_section_sizes(build_o)
-            if build_o.exists() and build_o.stat().st_size > 0:
-                found = [sanitize(s) for s in discover_sections(build_o)]
-                # A dependency file contributing nothing is normal -- a game uses
-                # a fraction of a shared library, and plenty of it compiles
-                # away entirely behind #ifdefs. Only the project's own sources
-                # are worth warning about; dependencies get a summary instead.
-                if (not found and sanitize(sources[key].stem) not in all_syms
-                        and not key.startswith(f'{DEP_PREFIX}/')):
-                    print(f"  Warning: {key} defines no discoverable symbols "
-                          f"(no 'i.' sections). Add --split_sections to its "
-                          f"cc.yaml flags if it holds more than one function.")
-                discovered[key] = found
-            else:
-                # Compile failed. The file can still claim the symbol it is
-                # named after below, so the symbol stays in the build and
-                # simply reads as unmatched.
-                discovered[key] = []
+            if (not info and build_o.exists() and build_o.stat().st_size > 0
+                    and sanitize(sources[key].stem) not in all_syms
+                    and not key.startswith(f'{DEP_PREFIX}/')):
+                print(f"  Warning: {key} defines no symbols.")
 
         result: dict[str, tuple[Path, str]] = {}
         owner: dict[str, str] = {}
@@ -428,13 +448,12 @@ class ProjectConfig:
                 for sym in discovered[key]:
                     claim(sym, key)
 
-        # Record how long each claimed symbol is once compiled. A function's
-        # literal pool lives at the end of its own section, so this is often
+        # Record how far each claimed symbol reaches once compiled. A function's
+        # literal pool sits between it and whatever follows, so this is often
         # longer than the size the symbol CSV gives.
         compiled = self._compiled_sizes.setdefault(bin_name, {})
         for sym, key in owner.items():
-            by_sym = sizes_by_key.get(key) or {}
-            size = by_sym.get(sym, by_sym.get('.text'))
+            size = (sizes_by_key.get(key) or {}).get(sym)
             if size:
                 compiled[sym] = size
 
