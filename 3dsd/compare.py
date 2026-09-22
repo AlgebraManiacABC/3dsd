@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from .elf import ELF
@@ -82,58 +83,50 @@ def _matches(compiled: ELF, split: ELF, sym: str, symbols_csv: Path | None,
     return True
 
 
-def discover_sections(obj_path: Path) -> list[str]:
-    """Read an ELF .o and return every symbol armcc gave its own section.
+@dataclass(frozen=True)
+class SymbolInfo:
+    """One symbol a compiled object defines.
 
-    --split_sections uses `i.NAME` for ordinary functions and `t.NAME` for
-    template instantiations; a C++ translation unit is usually full of the
-    latter, so missing them hides most of what it defines.
+    `segment` is where base.ld routes it, `size` is the length the compiler
+    declared, and `extent` is how far it reaches before the next symbol in the
+    same section -- longer than `size` whenever a literal pool or alignment
+    padding follows, which is what the comparison window has to cover.
+    """
+    segment: str
+    size: int
+    extent: int
+
+
+def discover_symbols(obj_path: Path) -> dict[str, SymbolInfo]:
+    """Read an ELF .o and return every symbol it defines, keyed by name.
+
+    This walks `.symtab` rather than the section headers, which matters more
+    than it sounds. armcc --split_sections gives each function its own `i.NAME`
+    section (`t.NAME` for a template instantiation) and does the same for data
+    in C -- but not in C++, where every global in a translation unit lands in
+    one shared `.data`. Reading section names therefore finds C data, misses
+    C++ data entirely, and finds nothing whatsoever in an object compiled
+    without the option.
+
+    The symbol table has no such gap: `gMycLife` is a 16-byte OBJECT in `.data`
+    either way, and a function keeps its name and size whether it sits alone in
+    `i.NAME` or at some offset inside a shared `.text`. Discovery is then
+    independent of --split_sections, which the progress path never needed
+    anyway -- the base ELF is a relocatable link carrying no addresses, and
+    objdiff pairs symbols by name.
+
+    Symbols are classified the way base.ld routes them, by section flags and
+    never by name: `i.png_sig_cmp` (AX) and `i.png_libpng_ver` (WA) are
+    indistinguishable otherwise. Two kinds are dropped. Anything outside an
+    allocatable section is debug bookkeeping (armcc's `__ARM_grp_.debug_frame$5`
+    and friends), and zero-initialised data has no bytes to compare -- claiming
+    it would only add unmatchable length to the target side.
     """
     try:
         data = obj_path.read_bytes()
     except (OSError, ValueError):
-        return []
+        return {}
     if len(data) < 0x34 or data[:4] != b'\x7fELF':
-        return []
-
-    reader = BinaryReader(obj_path.name, data)
-    reader.seek(0x20)
-    shoff = reader.read_u32()
-    reader.seek(0x30)
-    shnum = reader.read_u16()
-    shstrndx = reader.read_u16()
-
-    if shstrndx >= shnum:
-        return []
-
-    reader.seek(shoff + 0x28 * shstrndx + 0x10)
-    shstrtab_off = reader.read_u32()
-    reader.seek(shoff + 0x28 * shstrndx + 0x14)
-    shstrtab_size = reader.read_u32()
-    reader.seek(shstrtab_off)
-    shstrtab = reader.read_bytes(shstrtab_size)
-
-    names = []
-    for i in range(shnum):
-        reader.seek(shoff + 0x28 * i)
-        name_off = reader.read_u32()
-        name = get_name(shstrtab, name_off) if name_off < len(shstrtab) else ''
-        if name.startswith(('i.', 't.')):
-            names.append(name[2:])
-    return names
-
-
-def discover_section_sizes(obj_path: Path) -> dict[str, int]:
-    """Byte size of each `i.NAME`/`t.NAME` section, plus `.text`, by symbol.
-
-    Mirrors what `ELF.from_section` will later read, so a caller can learn how
-    long the compiled form of a symbol is without parsing the object again.
-    """
-    try:
-        data = obj_path.read_bytes()
-    except (OSError, ValueError):
-        return {}
-    if len(data) < 0x34 or data[:4] != b'ELF':
         return {}
 
     reader = BinaryReader(obj_path.name, data)
@@ -145,23 +138,79 @@ def discover_section_sizes(obj_path: Path) -> dict[str, int]:
     if shstrndx >= shnum:
         return {}
 
-    reader.seek(shoff + 0x28 * shstrndx + 0x10)
-    shstrtab_off = reader.read_u32()
-    reader.seek(shoff + 0x28 * shstrndx + 0x14)
-    shstrtab_size = reader.read_u32()
-    reader.seek(shstrtab_off)
-    shstrtab = reader.read_bytes(shstrtab_size)
+    SHT_SYMTAB = 2
+    SHT_NOBITS = 8
+    SHF_WRITE = 0x1
+    SHF_ALLOC = 0x2
+    SHF_EXECINSTR = 0x4
+    STT_OBJECT = 1
+    STT_FUNC = 2
+    SHN_LORESERVE = 0xFF00
 
-    sizes = {}
+    sections = []
+    symtab = None
     for i in range(shnum):
-        reader.seek(shoff + 0x28 * i)
+        reader.seek(shoff + 0x28 * i + 0x04)
+        sec = (reader.read_u32(),)               # type
+        reader.seek(shoff + 0x28 * i + 0x08)
+        sec += (reader.read_u32(),)              # flags
+        reader.seek(shoff + 0x28 * i + 0x10)
+        sec += (reader.read_u32(), reader.read_u32(), reader.read_u32())
+        sections.append(sec)                     # off, size, link
+        if sec[0] == SHT_SYMTAB and symtab is None:
+            symtab = (i, sec[2], sec[3], sec[4])
+
+    if symtab is None:
+        return {}
+    _, sym_off, sym_size, strtab_idx = symtab
+    if strtab_idx >= shnum:
+        return {}
+    reader.seek(sections[strtab_idx][2])
+    strtab = reader.read_bytes(sections[strtab_idx][3])
+
+    # Collected per section so extents can be measured against the neighbour
+    # that follows, which is the only thing that bounds a symbol once several
+    # of them share one section.
+    by_section: dict[int, list[tuple[int, str, int]]] = {}
+    for j in range(sym_size // 0x10):
+        reader.seek(sym_off + 0x10 * j)
         name_off = reader.read_u32()
-        name = get_name(shstrtab, name_off) if name_off < len(shstrtab) else ''
-        if not (name.startswith(('i.', 't.')) or name == '.text'):
+        value = reader.read_u32()
+        size = reader.read_u32()
+        info = reader.read_u8()
+        reader.read_u8()
+        shndx = reader.read_u16()
+
+        if info & 0xF not in (STT_OBJECT, STT_FUNC):
             continue
-        reader.seek(shoff + 0x28 * i + 0x14)
-        sizes[name[2:] if name[1:2] == '.' else name] = reader.read_u32()
-    return sizes
+        if shndx == 0 or shndx >= min(shnum, SHN_LORESERVE):
+            continue
+        name = get_name(strtab, name_off) if name_off < len(strtab) else ''
+        if not name:
+            continue
+        # A Thumb function carries its mode in bit 0 of the value; that bit is
+        # not part of the offset and would put every extent one byte short.
+        by_section.setdefault(shndx, []).append((value & ~1, name, size))
+
+    found: dict[str, SymbolInfo] = {}
+    for shndx, entries in by_section.items():
+        sec_type, flags, _off, sec_size, _link = sections[shndx]
+        if not flags & SHF_ALLOC:
+            continue
+        if flags & SHF_EXECINSTR:
+            segment = '.text'
+        elif sec_type == SHT_NOBITS:
+            continue
+        elif flags & SHF_WRITE:
+            segment = '.data'
+        else:
+            segment = '.rodata'
+
+        entries.sort()
+        for idx, (value, name, size) in enumerate(entries):
+            end = entries[idx + 1][0] if idx + 1 < len(entries) else sec_size
+            found[name] = SymbolInfo(segment, size, max(end - value, size))
+    return found
 
 
 def _load_sym_addrs(csv_path: Path, base_addr: int) -> dict[str, int]:

@@ -507,10 +507,30 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
                 seg_start = sym.addr
         sections.append((seg_name, seg_start, len(data)))
 
-    # Build section index map: section list index -> ELF shndx (1-based)
+    # A segment that stops and starts again produces two runs with one name,
+    # and objdiff pairs sections by name: it would keep the first and ignore
+    # the rest, silently shrinking the totals. Interleaving is normal once data
+    # symbols are in play -- a decompiled table sitting between two
+    # undecompiled ones splits .rodata in three -- so the runs are concatenated
+    # into one section per name rather than rejected. Addresses are not
+    # preserved across the join, which costs nothing: objdiff reads symbol
+    # offsets within a section, never their original addresses.
+    merged: dict[str, list[tuple[int, int]]] = {}
+    for name, start, end in sections:
+        merged.setdefault(name, []).append((start, end))
+    sec_names = list(merged)
+
+    # Where each run lands inside its merged section, and which ELF section
+    # index that is (shndx 0 is the NULL entry).
+    run_offset = {}
+    for name, runs in merged.items():
+        off = 0
+        for start, end in runs:
+            run_offset[(name, start)] = off
+            off += end - start
     sec_shndx = {}
-    for i, (name, _, _) in enumerate(sections):
-        sec_shndx[i] = i + 1  # shndx 0 is NULL
+    for i, (name, start, _end) in enumerate(sections):
+        sec_shndx[i] = sec_names.index(name) + 1
 
     # Build symbol tables
     local_strtab = bytearray(b'\x00')
@@ -522,10 +542,9 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
         # Advance to the section containing this symbol
         while sec_idx < len(sections) - 1 and sym.addr >= sections[sec_idx + 1][1]:
             sec_idx += 1
-        _, sec_start, _ = sections[sec_idx]
+        sec_name, sec_start, _ = sections[sec_idx]
         shndx = sec_shndx[sec_idx]
-        sec_name = sections[sec_idx][0]
-        sym_value = sym.addr - sec_start
+        sym_value = run_offset[(sec_name, sec_start)] + (sym.addr - sec_start)
         is_code = sec_name == '.text'
         thumb = 1 if is_code and sym.mode == '$t' else 0
         sym_type = 0x12 if is_code else 0x11  # STT_FUNC / STT_OBJECT
@@ -543,11 +562,16 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
     writer = BinaryWriter()
     ELFHeader(0, 0, 0, True).write(writer)
 
-    # Section data
+    # Section data: every run of a name, back to back, one section per name.
     sec_offsets = []
-    for name, start, end in sections:
+    sec_sizes = []
+    for name in sec_names:
         sec_offsets.append(writer.tell())
-        writer.write_bytes(data[start:end])
+        size = 0
+        for start, end in merged[name]:
+            writer.write_bytes(data[start:end])
+            size += end - start
+        sec_sizes.append(size)
         pad_to_4(writer)
 
     # Symtab
@@ -566,7 +590,7 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
     shstrtab_off = writer.tell()
     writer.write_u8(0)
     sec_name_offsets = []
-    for name, _, _ in sections:
+    for name in sec_names:
         sec_name_offsets.append(writer.tell() - shstrtab_off)
         writer.write_str(name)
     symtab_name_off = writer.tell() - shstrtab_off
@@ -579,15 +603,15 @@ def write_target_elf(out_path: Path, data: bytes, sym_list: list[Symbol]):
 
     # Section header table
     sh_off = writer.tell()
-    num_sections = len(sections)
+    num_sections = len(sec_names)
     # [0] NULL
     SectionHeaderEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0).write(writer)
     # [1..N] data sections
-    for i, (name, start, end) in enumerate(sections):
+    for i, name in enumerate(sec_names):
         sh_type, sh_flags = _SECTION_FLAGS.get(name, (SectionHeaderType.SHT_PROGBITS,
                                                        SectionHeaderFlags.SHF_ALLOC))
         SectionHeaderEntry(sec_name_offsets[i], sh_type, sh_flags, 0,
-                           sec_offsets[i], end - start, 0, 0, 0, 4).write(writer)
+                           sec_offsets[i], sec_sizes[i], 0, 0, 0, 4).write(writer)
     # symtab: link=strtab index, info=first global
     symtab_link = num_sections + 2  # .strtab section index
     SectionHeaderEntry(symtab_name_off, SectionHeaderType.SHT_SYMTAB, 0, 0, symtab_off,

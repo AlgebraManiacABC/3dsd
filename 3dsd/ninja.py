@@ -240,7 +240,15 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
         if compiled_objects:
             base_elf = _rel(config.out_dir / 'objdiff_base' / bin_name)
             base_obj_list = ' '.join(_escape_ninja(o) for o in compiled_objects)
-            lines.append(f'build {_escape_ninja(base_elf)}: link_base {base_obj_list}')
+            # base.ld decides which sections the base ends up with, so editing
+            # it has to relink. Without this the old base survives and pairs
+            # against sections the new script no longer emits -- a data section
+            # renamed here read as 0% matched until a full clean, with nothing
+            # to suggest the base was stale.
+            ld_script = _escape_ninja(
+                (Path(__file__).parent / 'base.ld').as_posix())
+            lines.append(f'build {_escape_ninja(base_elf)}: link_base '
+                         f'{base_obj_list} | {ld_script}')
             lines.append('')
             base_elf_targets.append(base_elf)
             default_targets.append(base_elf)
