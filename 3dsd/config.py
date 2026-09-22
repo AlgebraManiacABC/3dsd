@@ -402,9 +402,11 @@ class ProjectConfig:
 
         discovered: dict[str, list[str]] = {}
         sizes_by_key: dict[str, dict[str, int]] = {}
+        vague_by_key: dict[str, set[str]] = {}
         for key in sorted(sources):
             info = symbols_by_key.get(key, {})
             sizes_by_key[key] = {sanitize(n): i.extent for n, i in info.items()}
+            vague_by_key[key] = {sanitize(n) for n, i in info.items() if i.vague}
             discovered[key] = [sanitize(n) for n in info]
             # A dependency file contributing nothing is normal -- a game uses
             # a fraction of a shared library, and plenty of it compiles away
@@ -418,12 +420,23 @@ class ProjectConfig:
 
         result: dict[str, tuple[Path, str]] = {}
         owner: dict[str, str] = {}
+        folded: list[str] = []
 
         def claim(sym: str, key: str):
             if sym not in all_syms:
                 return
             if sym in owner:
                 if owner[sym] != key:
+                    # A vtable, an RTTI record or a template instantiation is
+                    # emitted by every translation unit that needs it, and the
+                    # linker folds the copies into the one the original binary
+                    # has. Both sides being vague-linkage means the duplication
+                    # is C++ working as specified, so it is counted, not warned
+                    # about; a strong definition on either side is a real clash.
+                    if (sym in vague_by_key.get(key, ())
+                            and sym in vague_by_key.get(owner[sym], ())):
+                        folded.append(sym)
+                        return
                     print(f"  Warning: {sym} is defined by both {owner[sym]} "
                           f"and {key}; keeping {owner[sym]}.")
                 return
@@ -447,6 +460,10 @@ class ProjectConfig:
             for key in group:
                 for sym in discovered[key]:
                     claim(sym, key)
+
+        if folded:
+            print(f"  Folded {len(folded)} duplicate definition(s) of "
+                  f"{len(set(folded))} vague-linkage symbol(s).")
 
         # Record how far each claimed symbol reaches once compiled. A function's
         # literal pool sits between it and whatever follows, so this is often
