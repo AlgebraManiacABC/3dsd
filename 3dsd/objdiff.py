@@ -189,6 +189,23 @@ def _ratio(num: str, den: str, tint: float | None) -> tuple:
     return (_RATIO, num, den, tint)
 
 
+def _percent(value: float, tint: float | None) -> tuple:
+    """A percentage cell, shown as '-' when it is an absolute zero.
+
+    A screenful of `0.0000%` says nothing that a dash does not, and it buries
+    the rows that have actually moved. The dash keeps the zero tint, so it
+    still reads as red-for-nothing rather than as the untinted dash used for
+    a figure that does not apply at all -- an unstarted binary and one with
+    no data section stay distinguishable.
+
+    Only an exact zero is collapsed. A value that merely rounds to `0.0000%`
+    is real progress and keeps its digits.
+    """
+    if value == 0.0:
+        return _text('-', 0.0)
+    return _text(f'{value:.4f}%', tint)
+
+
 def data_fuzzy_percent(sections: list[dict], total_data: int) -> float | None:
     """Size-weighted mean of the fuzzy percent over the data sections.
 
@@ -249,19 +266,28 @@ def measure_row(measures: dict, label: str,
     grand_matched = mc + md  # md is 0 unless objdiff measured it
     grand_f = (grand_matched / grand_total) if grand_total else None
 
-    data_cell = (_ratio(f'{md:,}', f'{td:,}', data_f) if td else _text('-'))
+    # A binary with no data section of its own -- every .cro here -- still
+    # tints its data cells as zero, so a row that has not moved reads as one
+    # colour instead of leaving the three data columns as the only untinted
+    # cells in it. The untinted dash is kept for the one case that really is
+    # unknown rather than zero: data exists but its section sizes disagree
+    # with objdiff's total, so data_fuzzy_percent declined to guess.
+    absent = _text('-', 0.0)
+    unknown = _text('-')
+
+    data_cell = _ratio(f'{md:,}', f'{td:,}', data_f) if td else absent
 
     return [
         _text(label),
-        _ratio(f'{mc:,}', f'{tc:,}', code_f) if tc else _text('-'),
-        _text(f'{code_pct:.4f}%', code_f) if tc else _text('-'),
-        _text(f'{fuzzy_pct:.4f}%', fuzzy_pct / 100) if tc else _text('-'),
+        _ratio(f'{mc:,}', f'{tc:,}', code_f) if tc else absent,
+        _percent(code_pct, code_f) if tc else absent,
+        _percent(fuzzy_pct, fuzzy_pct / 100) if tc else absent,
         data_cell,
-        _text(f'{data_pct:.4f}%', data_f) if td else _text('-'),
-        _text(f'{data_fuzzy:.4f}%', data_fuzzy / 100)
-        if data_fuzzy is not None else _text('-'),
-        _text(f'{grand_total:,}') if grand_total else _text('-'),
-        _text(f'{grand_f * 100:.4f}%', grand_f) if grand_total else _text('-'),
+        _percent(data_pct, data_f) if td else absent,
+        _percent(data_fuzzy, data_fuzzy / 100) if data_fuzzy is not None
+        else (unknown if td else absent),
+        _text(f'{grand_total:,}') if grand_total else unknown,
+        _percent(grand_f * 100, grand_f) if grand_total else absent,
     ]
 
 
