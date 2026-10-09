@@ -1,5 +1,6 @@
+"""Verifying recreated binaries against the originals."""
+
 import hashlib
-import sys
 from pathlib import Path
 
 from .config import ProjectConfig
@@ -15,6 +16,21 @@ def check_binary(original: Path, built: Path) -> bool:
     print(f"  MISMATCH: {built.name}")
     print(f"    Original: {orig_hash.hex()}")
     print(f"    Built:    {built_hash.hex()}")
+    return False
+
+
+def verify_file(original: Path, built: Path, stamp: Path) -> bool:
+    """The ninja `verify` step: check one binary and record a pass in `stamp`.
+
+    The stamp is written only on a match and removed on a mismatch, so ninja
+    reruns the check until it passes and a failing round-trip fails the build
+    instead of leaving a stale "verified" behind.
+    """
+    if check_binary(original, built):
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(f"{built.name} matches {original.name}\n")
+        return True
+    stamp.unlink(missing_ok=True)
     return False
 
 
@@ -44,16 +60,3 @@ def run_check(config: ProjectConfig) -> bool:
         print("  Run '3dsd build --roundtrip' to split, relink and verify.")
         return False
     return all_ok
-
-
-def run_check_cli(argv: list[str]) -> int:
-    """CLI entry point for single-file check (called by Ninja)."""
-    import argparse
-    parser = argparse.ArgumentParser(prog="3dsd check")
-    parser.add_argument("--original", required=True)
-    parser.add_argument("--built", required=True)
-    args = parser.parse_args(argv)
-
-    if check_binary(Path(args.original), Path(args.built)):
-        return 0
-    return 1

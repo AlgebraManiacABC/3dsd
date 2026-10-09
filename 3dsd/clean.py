@@ -1,7 +1,9 @@
+"""`3dsd clean`: removing generated output."""
+
 import shutil
 from pathlib import Path
 
-from .config import BUILD_DIR, SPLIT_DIR, LINK_DIR, OUT_DIR
+from .config import BUILD_DIR, LINK_DIR, OUT_DIR, SPLIT_DIR
 
 # Each target maps to the paths it removes, relative to the working directory.
 # Paths that do not exist are skipped silently.
@@ -29,7 +31,7 @@ def _resolve(targets: list[str]) -> list[str]:
         return list(_ALL)
     unknown = [t for t in targets if t not in _TARGETS]
     if unknown:
-        valid = ', '.join(_ALL + ['all'])
+        valid = ', '.join([*_ALL, 'all'])
         raise ValueError(
             f"Unknown clean target(s): {', '.join(unknown)}\n  Valid targets: {valid}")
     # Preserve _ALL's order and drop duplicates.

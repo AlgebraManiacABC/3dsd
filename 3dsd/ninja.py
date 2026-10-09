@@ -1,50 +1,206 @@
+"""build.ninja generation."""
+
 import sys
 from pathlib import Path
 
 from .config import ProjectConfig
-from .util import sanitize
+from .ctrtype import CTRBinary
+from .util import Symbol, posix, sanitize
 
+_PACKAGE_DIR = Path(__file__).parent
+_LINKER_LD = _PACKAGE_DIR / 'linker.ld'
+_BASE_LD = _PACKAGE_DIR / 'base.ld'
+_LD_FLAGS = '--entry=0 --no-warn-mismatch --use-blx -T $linker_ld'
 
-def _posix(p: Path | str) -> str:
-    return str(p).replace('\\', '/')
+_RULES = [
+    '# === Rules ===',
+    '',
+    'rule compile',
+    '  command = $tool compile --source $in --output $out --cc $cc_path $flags_arg',
+    '  description = CC $desc',
+    '',
+    'rule link',
+    '  command = $ld $ldflags @$out.rsp -o $out -Map $out.map',
+    '  rspfile = $out.rsp',
+    '  rspfile_content = $in_newline',
+    '  description = LINK $out',
+    '',
+    'rule to_binary',
+    '  command = $objcopy $in -O binary $out',
+    '  description = BIN $out',
+    '',
+    'rule cro_from_elf',
+    ('  command = $tool cro-from-elf --linked $in --original $original --output $out'
+     ' --objcopy $objcopy'),
+    '  description = CRO $out',
+    '',
+    'rule link_base',
+    '  command = $tool link-base --ld $ld --output $out --rsp $out.rsp',
+    '  rspfile = $out.rsp',
+    '  rspfile_content = $in_newline',
+    '  description = LINK_BASE $out',
+    '',
+    'rule verify',
+    '  command = $tool check-file --original $original --built $in --stamp $out',
+    '  description = VERIFY $desc',
+    '',
+]
 
 
 def _escape_ninja(s: str) -> str:
     return s.replace('$', '$$').replace(' ', '$ ').replace(':', '$:')
 
 
-def _extended_split(config: ProjectConfig, bin_name: str, sym, sym_addr: int,
-                    sym_size: int, gap_end: int):
-    """Write the comparison window for a symbol whose compiled form is longer.
+def _escape_all(paths: list[str]) -> str:
+    return ' '.join(_escape_ninja(p) for p in paths)
 
-    armcc keeps a function's literal pool inside that function's own section,
-    while a symbol's declared size covers only its instructions -- Ghidra is
-    right about that, the pool is data. The bytes between the two are normally
-    unclaimed padding plus the pool, so the comparison is widened to cover
-    them rather than asking anyone to overstate the function's size.
 
-    Only ever widens up to the next symbol, and never past it: absorbing a
-    neighbour's bytes would be wrong. Widening can only make a comparison
-    stricter -- more bytes have to agree -- so it cannot invent a match.
-    Returns None when nothing needs to change.
+def _split_names(symbols: list[Symbol], bin_size: int):
+    """Yield the name of every split object, in address order.
+
+    Named symbols give their sanitized name; each unnamed stretch between
+    them is named after its address. Together they cover the binary end to
+    end, exactly as `split_binary` cuts it.
     """
-    if sym is None:
-        return None
-    compiled = config.compiled_size(bin_name, sanitize(sym.name))
-    if not compiled or compiled <= sym_size:
-        return None
-    if sym_addr + compiled > gap_end:
-        return None
+    sym_dict = {sym.addr: sym for sym in symbols if sym.addr >= 0}
+    addrs = sorted(sym_dict)
+    cur_addr = 0
+    addr_idx = 0
+    while addr_idx < len(addrs) or cur_addr < bin_size:
+        if addr_idx >= len(addrs):
+            yield f'{cur_addr:08x}'
+            cur_addr = bin_size
+        elif cur_addr == addrs[addr_idx]:
+            sym = sym_dict[cur_addr]
+            next_addr = addrs[addr_idx + 1] if addr_idx + 1 < len(addrs) else bin_size
+            yield sanitize(sym.name)
+            cur_addr += min(sym.size, next_addr - cur_addr)
+            addr_idx += 1
+        elif cur_addr < addrs[addr_idx]:
+            yield f'{cur_addr:08x}'
+            cur_addr = addrs[addr_idx]
+        else:
+            raise RuntimeError(f"Address tracking error at {cur_addr:08x}")
 
-    from .elf import ELF
-    from .util import Symbol
-    data = config.binaries[bin_name].data[sym_addr:sym_addr + compiled]
-    name = sanitize(sym.name)
-    out = config.build_dir / bin_name / '.extents' / f'{name}.o'
-    out.parent.mkdir(parents=True, exist_ok=True)
-    ELF.from_bytes_single(data, Symbol(sym_addr, name, sym.mode, compiled,
-                                       sym.segment)).write(out)
-    return out
+
+class _NinjaWriter:
+    """Accumulates build.ninja lines and the targets the phony rules need."""
+
+    def __init__(self, config: ProjectConfig, roundtrip: bool):
+        self.config = config
+        self.roundtrip = roundtrip
+        self.lines: list[str] = []
+        self.default_targets: list[str] = []
+        self.compile_targets: list[str] = []
+        self.base_elf_targets: list[str] = []
+
+    def rel(self, p: Path) -> str:
+        """Make a path relative to working_dir for the ninja file."""
+        try:
+            return posix(p.relative_to(self.config.working_dir))
+        except ValueError:
+            return posix(p)
+
+    def emit(self, *lines: str):
+        self.lines.extend(lines)
+
+    def binary(self, bin_name: str, binary: CTRBinary):
+        """Emit every build statement for one binary."""
+        config = self.config
+        self.emit(f'# === {bin_name} ===', '')
+
+        source_map = config.get_source_map(bin_name)
+        names = list(_split_names(config.symbols.get(bin_name, []), len(binary.data)))
+
+        # One compile per source that claims at least one symbol, in the order
+        # its first symbol appears in the binary -- which is also the order the
+        # base ELF links them in.
+        compiled_objects: list[str] = []
+        emitted: set[str] = set()
+        for name in names:
+            if name not in source_map:
+                continue
+            src_path, src_key = source_map[name]
+            if src_key in emitted:
+                continue
+            emitted.add(src_key)
+            build_o = self.rel(config.obj_path(bin_name, src_key))
+            compiled_objects.append(build_o)
+            self.compile_targets.append(build_o)
+            self._compile(bin_name, src_path, src_key, build_o)
+
+        # The objdiff base ELF is the progress path: compiled objects only.
+        if compiled_objects:
+            base_elf = self.rel(config.out_dir / 'objdiff_base' / bin_name)
+            # base.ld decides which sections the base ends up with, so editing
+            # it has to relink. Without this the old base survives and pairs
+            # against sections the new script no longer emits -- a data section
+            # renamed here read as 0% matched until a full clean, with nothing
+            # to suggest the base was stale.
+            self.emit(f'build {_escape_ninja(base_elf)}: link_base '
+                      f'{_escape_all(compiled_objects)} | {_escape_ninja(_BASE_LD.as_posix())}',
+                      '')
+            self.base_elf_targets.append(base_elf)
+            self.default_targets.append(base_elf)
+
+        if self.roundtrip:
+            self._relink(bin_name, [self.rel(config.split_dir / bin_name / f'{name}.o')
+                                    for name in names])
+
+    def _compile(self, bin_name: str, src_path: Path, src_key: str, build_o: str):
+        cc_path, flags = self.config.get_cc(bin_name, src_key)
+        flags_arg = '--flags=' + ','.join(flags) if flags else ''
+        self.emit(f'build {_escape_ninja(build_o)}: compile {_escape_ninja(self.rel(src_path))}',
+                  f'  cc_path = {posix(cc_path.resolve())}',
+                  f'  flags_arg = {flags_arg}',
+                  f'  desc = {bin_name}/{src_key}',
+                  '')
+
+    def _relink(self, bin_name: str, split_objects: list[str]):
+        """Link the split originals, flatten to a binary, and verify it.
+
+        Every object here holds original bytes, so this checks the pipeline
+        -- the split, the linker script, the CRO rebuild -- and not the decomp.
+        The verify stamp is the default target, so a mismatch fails the build.
+        """
+        config = self.config
+        linked = self.rel(config.link_dir / f'{bin_name}_linked')
+        self.emit(f'build {_escape_ninja(linked)}: link {_escape_all(split_objects)}',
+                  f'  ldflags = {_LD_FLAGS}',
+                  '')
+
+        orig_file = next((p for p in config.originals if p.name == bin_name), None)
+        final_bin = self.rel(config.out_dir / bin_name)
+        if '.cro' in bin_name:
+            if orig_file is None:
+                raise RuntimeError(f"No original for {bin_name} in {config.originals}")
+            self.emit(f'build {_escape_ninja(final_bin)}: cro_from_elf {_escape_ninja(linked)}',
+                      f'  original = {self.rel(orig_file)}',
+                      '')
+        else:
+            self.emit(f'build {_escape_ninja(final_bin)}: to_binary {_escape_ninja(linked)}',
+                      '')
+
+        if orig_file is None:
+            self.default_targets.append(final_bin)
+            return
+        original = self.rel(orig_file)
+        stamp = self.rel(config.out_dir / f'{bin_name}.verified')
+        self.emit(f'build {_escape_ninja(stamp)}: verify {_escape_ninja(final_bin)}'
+                  f' | {_escape_ninja(original)}',
+                  f'  original = {original}',
+                  f'  desc = {bin_name}',
+                  '')
+        self.default_targets.append(stamp)
+
+    def phonies(self):
+        """The `compile` and `objdiff` aliases and the default targets."""
+        if self.compile_targets:
+            self.emit(f'build compile: phony {_escape_all(self.compile_targets)}', '')
+        if self.base_elf_targets:
+            self.emit(f'build objdiff: phony {_escape_all(self.base_elf_targets)}', '')
+        if self.default_targets:
+            self.emit(f'default {_escape_all(self.default_targets)}', '')
 
 
 def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
@@ -55,29 +211,15 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
     ELF. The objdiff target is built from the original binary and the symbol
     CSV, so nothing in the progress path needs the split.
 
-    `roundtrip` adds the byte-perfect rebuild on top -- the per-symbol compare
-    objects, the full link, the flatten/CRO step and the verify. That path
-    exercises the pipeline rather than the decomp: every object it links holds
-    original bytes, so it can only confirm that the split and the relink agree
-    with the binary they came from. It costs a split of every symbol in the
-    binary and a link of all of them (74,384 objects for ACNL's code.bin), so
-    it is opt-in.
+    `roundtrip` adds the byte-perfect rebuild on top: every split object
+    linked back together, flattened (or rebuilt as a CRO), and hashed against
+    the original. That path exercises the pipeline rather than the decomp --
+    every object it links holds original bytes -- and it costs a link of every
+    symbol in the binary (74,384 objects for ACNL's code.bin), so it is opt-in.
     """
     ninja_path = config.working_dir / 'build.ninja'
-    linker_ld = Path(__file__).parent / 'linker.ld'
-    wd = config.working_dir
-
-    def _rel(p: Path) -> str:
-        """Make a path relative to working_dir for the ninja file."""
-        try:
-            return _posix(p.relative_to(wd))
-        except ValueError:
-            return _posix(p)
-
-    ld = _posix(config.ld_path().resolve())
-    objcopy = _posix(config.objcopy_path().resolve())
-    pipeline_dir = Path(__file__).parent.parent.resolve()
-    python = _posix(Path(sys.executable).resolve())
+    pipeline_dir = _PACKAGE_DIR.parent.resolve()
+    python = posix(Path(sys.executable).resolve())
 
     # '3dsd' is not a valid Python identifier, so the wrapper loads the
     # package via importlib instead of an import statement.
@@ -87,222 +229,26 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
         f"import sys, importlib; sys.path.insert(0, {str(pipeline_dir)!r}); "
         f"importlib.import_module('3dsd.__main__').main()\n"
     )
-    tool_cmd = f'"{python}" "{_posix(wrapper.resolve())}"'
+    tool_cmd = f'"{python}" "{posix(wrapper.resolve())}"'
 
     (config.out_dir / 'objdiff_base').mkdir(parents=True, exist_ok=True)
 
-    lines = [
-        '# Generated by 3dsd ninja — do not edit',
-        'ninja_required_version = 1.3',
-        '',
-        f'ld = {ld}',
-        f'objcopy = {objcopy}',
-        f'tool = {tool_cmd}',
-        f'linker_ld = {_posix(linker_ld.resolve())}',
-        '',
-        '# === Rules ===',
-        '',
-        'rule compile',
-        '  command = $tool compile --source $in --output $out --cc $cc_path $flags_arg',
-        '  description = CC $desc',
-        '',
-        'rule compare',
-        '  command = $tool extract-compare --compiled $in --split $split --output $out --sym $sym --symbols $symbols --base-addr $base_addr --split-addr $split_addr $cmp_arg',
-        '  description = CMP $desc',
-        '',
-        'rule link',
-        '  command = $ld $ldflags @$out.rsp -o $out -Map $out.map',
-        '  rspfile = $out.rsp',
-        '  rspfile_content = $in_newline',
-        '  description = LINK $out',
-        '',
-        'rule to_binary',
-        '  command = $objcopy $in -O binary $out',
-        '  description = BIN $out',
-        '',
-        'rule cro_from_elf',
-        '  command = $tool cro-from-elf --linked $in --original $original --output $out --objcopy $objcopy',
-        '  description = CRO $out',
-        '',
-        'rule link_base',
-        '  command = $tool link-base --ld $ld --output $out --rsp $out.rsp',
-        '  rspfile = $out.rsp',
-        '  rspfile_content = $in_newline',
-        '  description = LINK_BASE $out',
-        '',
-        'rule verify',
-        '  command = $tool check-file --original $original --built $in',
-        '  description = VERIFY $desc',
-        '',
-    ]
-
-    default_targets = []
-    compile_targets: list[str] = []
-    base_elf_targets: list[str] = []
-    ld_flags = '--entry=0 --no-warn-mismatch --use-blx -T $linker_ld'
-
+    out = _NinjaWriter(config, roundtrip)
+    out.emit('# Generated by 3dsd ninja — do not edit',
+             'ninja_required_version = 1.3',
+             '',
+             f'ld = {posix(config.ld_path().resolve())}',
+             f'objcopy = {posix(config.objcopy_path().resolve())}',
+             f'tool = {tool_cmd}',
+             f'linker_ld = {posix(_LINKER_LD.resolve())}',
+             '',
+             *_RULES)
     for bin_name, binary in config.binaries.items():
-        lines.append(f'# === {bin_name} ===')
-        lines.append('')
+        out.binary(bin_name, binary)
+    out.phonies()
 
-        symbols = config.symbols.get(bin_name, [])
-        source_map = config.get_source_map(bin_name)
-        sym_dict = {sym.addr: sym for sym in symbols if sym.addr >= 0}
-        addrs = sorted(sym_dict.keys())
-        bin_size = len(binary.data)
-        base_addr = binary.base_addr
-
-        sym_csv_posix = _rel(config.working_dir / 'symbols' / f'{bin_name}.csv')
-
-        emitted_compile: set[str] = set()
-        compiled_objects: list[str] = []
-
-        # Walk through all addresses to build the full object list
-        link_objects: list[str] = []
-        cur_addr = 0
-        addr_idx = 0
-
-        while addr_idx < len(addrs) or cur_addr < bin_size:
-            if addr_idx >= len(addrs):
-                sym_name = f'{cur_addr:08x}'
-                sym_size = bin_size - cur_addr
-                sym_addr = cur_addr
-                cur_addr += sym_size
-                cur_sym, gap_end = None, 0
-            elif cur_addr == addrs[addr_idx]:
-                sym = sym_dict[cur_addr]
-                sym_name = sanitize(sym.name)
-                sym_size = sym.size
-                sym_addr = cur_addr
-                next_addr = addrs[addr_idx + 1] if addr_idx + 1 < len(addrs) else bin_size
-                if cur_addr + sym_size > next_addr:
-                    sym_size = next_addr - cur_addr
-                cur_addr += sym_size
-                addr_idx += 1
-                cur_sym, gap_end = sym, next_addr
-            elif cur_addr < addrs[addr_idx]:
-                sym_name = f'{cur_addr:08x}'
-                sym_addr = cur_addr
-                cur_addr = addrs[addr_idx]
-                cur_sym, gap_end = None, 0
-            else:
-                raise RuntimeError(f"Address tracking error at {cur_addr:08x}")
-
-            split_o = _rel(config.split_dir / bin_name / f'{sym_name}.o')
-
-            if sym_name in source_map:
-                src_path, src_key = source_map[sym_name]
-                build_o = _rel(config.obj_path(bin_name, src_key))
-                link_o = _rel(config.link_dir / bin_name / f'{sym_name}.o')
-
-                if src_key not in emitted_compile:
-                    emitted_compile.add(src_key)
-                    compiled_objects.append(build_o)
-                    compile_targets.append(build_o)
-                    cc_path, flags = config.get_cc(bin_name, src_key)
-                    cc_posix = _posix(cc_path.resolve())
-                    flags_arg = '--flags=' + ','.join(flags) if flags else ''
-
-                    lines.append(f'build {_escape_ninja(build_o)}: compile {_escape_ninja(_rel(src_path))}')
-                    lines.append(f'  cc_path = {cc_posix}')
-                    lines.append(f'  flags_arg = {flags_arg}')
-                    lines.append(f'  desc = {bin_name}/{src_key}')
-                    lines.append('')
-
-                if not roundtrip:
-                    continue
-
-                cmp_o = _extended_split(config, bin_name, cur_sym,
-                                        sym_addr, sym_size, gap_end)
-                deps = _escape_ninja(split_o)
-                cmp_arg = ''
-                if cmp_o:
-                    rel = _rel(cmp_o)
-                    deps += ' ' + _escape_ninja(rel)
-                    cmp_arg = f'--compare-split {rel}'
-
-                lines.append(f'build {_escape_ninja(link_o)}: compare {_escape_ninja(build_o)} | {deps}')
-                lines.append(f'  cmp_arg = {cmp_arg}')
-                lines.append(f'  split = {split_o}')
-                lines.append(f'  sym = {sym_name}')
-                lines.append(f'  symbols = {sym_csv_posix}')
-                lines.append(f'  base_addr = {base_addr:#x}')
-                lines.append(f'  split_addr = {sym_addr:#x}')
-                lines.append(f'  desc = {bin_name}/{sym_name}')
-                lines.append('')
-
-                link_objects.append(link_o)
-            elif roundtrip:
-                link_objects.append(split_o)
-
-        # The objdiff base ELF is the progress path: compiled objects only.
-        base_elf = None
-        if compiled_objects:
-            base_elf = _rel(config.out_dir / 'objdiff_base' / bin_name)
-            base_obj_list = ' '.join(_escape_ninja(o) for o in compiled_objects)
-            # base.ld decides which sections the base ends up with, so editing
-            # it has to relink. Without this the old base survives and pairs
-            # against sections the new script no longer emits -- a data section
-            # renamed here read as 0% matched until a full clean, with nothing
-            # to suggest the base was stale.
-            ld_script = _escape_ninja(
-                (Path(__file__).parent / 'base.ld').as_posix())
-            lines.append(f'build {_escape_ninja(base_elf)}: link_base '
-                         f'{base_obj_list} | {ld_script}')
-            lines.append('')
-            base_elf_targets.append(base_elf)
-            default_targets.append(base_elf)
-
-        if not roundtrip:
-            continue
-
-        # Link all objects (full link with linker script)
-        linked = _rel(config.link_dir / f'{bin_name}_linked')
-        obj_list = ' '.join(_escape_ninja(o) for o in link_objects)
-        lines.append(f'build {_escape_ninja(linked)}: link {obj_list}')
-        lines.append(f'  ldflags = {ld_flags}')
-        lines.append('')
-
-        # Convert to binary
-        is_cro = '.cro' in bin_name
-        if is_cro:
-            final_bin = _rel(config.out_dir / bin_name)
-            orig_bin = _rel(next(p for p in config.originals if p.name == bin_name))
-
-            lines.append(f'build {_escape_ninja(final_bin)}: cro_from_elf {_escape_ninja(linked)}')
-            lines.append(f'  original = {orig_bin}')
-            lines.append('')
-        else:
-            final_bin = _rel(config.out_dir / bin_name)
-            lines.append(f'build {_escape_ninja(final_bin)}: to_binary {_escape_ninja(linked)}')
-            lines.append('')
-
-        # Verify
-        orig_file = next((p for p in config.originals if p.name == bin_name), None)
-        if orig_file:
-            stamp = _rel(config.out_dir / f'{bin_name}.verified')
-            lines.append(f'build {_escape_ninja(stamp)}: verify {_escape_ninja(final_bin)}')
-            lines.append(f'  original = {_rel(orig_file)}')
-            lines.append(f'  desc = {bin_name}')
-            lines.append('')
-
-        default_targets.append(final_bin)
-
-    # Phony targets
-    if compile_targets:
-        lines.append(f'build compile: phony {" ".join(_escape_ninja(t) for t in compile_targets)}')
-        lines.append('')
-
-    if base_elf_targets:
-        lines.append(f'build objdiff: phony {" ".join(_escape_ninja(t) for t in base_elf_targets)}')
-        lines.append('')
-
-    if default_targets:
-        lines.append(f'default {" ".join(_escape_ninja(t) for t in default_targets)}')
-        lines.append('')
-
-    ninja_path.write_text('\n'.join(lines))
+    ninja_path.write_text('\n'.join(out.lines))
     print(f"Generated {ninja_path}")
     mode = 'progress + byte-perfect round-trip' if roundtrip else 'decomp progress'
     print(f"  Targets: {mode}.")
-    print(f"  Run 'ninja' to build, or 'ninja compile' to compile only.")
+    print("  Run 'ninja' to build, or 'ninja compile' to compile only.")

@@ -1,3 +1,5 @@
+"""Shared primitives: binary I/O, symbols, relocations and small helpers."""
+
 import re
 import struct
 from enum import IntEnum
@@ -6,7 +8,18 @@ from pathlib import Path
 from typing import Protocol
 
 
+class PipelineError(Exception):
+    """A problem with the project or its inputs, reported without a traceback.
+
+    Raised for anything the user fixes by editing their project -- a missing
+    directory, a bad cc.yaml entry, a compiler that reports the wrong version
+    -- as opposed to a bug in the pipeline itself.
+    """
+
+
 class BinaryReader:
+    """Little-endian reader over an in-memory byte string."""
+
     def __init__(self, name: str, data: bytes):
         self._stream = BytesIO(data)
         self.name = name
@@ -47,6 +60,9 @@ class BinaryReader:
 
 
 class BinaryWriter:
+    """Little-endian writer into an in-memory buffer; seeking past the end
+    zero-fills."""
+
     def __init__(self):
         self._stream = BytesIO()
 
@@ -82,20 +98,32 @@ class BinaryWriter:
 
 
 class Writable(Protocol):
-    def write(self, writer: BinaryWriter) -> None: ...
+    """Anything that can serialise itself into a BinaryWriter."""
+
+    def write(self, writer: BinaryWriter) -> None:
+        """Serialise into `writer` at its current position."""
 
 
 class WritableStr(str):
+    """A str that writes itself NUL-terminated."""
+
     def write(self, writer: BinaryWriter) -> None:
+        """Write the string and its terminator."""
         writer.write_str(self)
 
 
 class WritableBytes(bytes):
+    """A bytes object that writes itself verbatim."""
+
     def write(self, writer: BinaryWriter) -> None:
+        """Write the bytes as they are."""
         writer.write_bytes(self)
 
 
 class Symbol:
+    """One row of a symbol CSV. `addr` is made relative to the binary's base
+    address once the binary is known."""
+
     def __init__(self, addr: int, name: str, mode: str, size: int, segment: str,
                  namespace: str = ''):
         self.addr = addr
@@ -119,14 +147,15 @@ class Symbol:
 
 
 class RelocationType(IntEnum):
+    """ARM ELF relocation types; unlisted values become R_ARM_UNKNOWN_<n>."""
     R_ARM_NONE = 0
     R_ARM_ABS32 = 2
     R_ARM_REL32 = 3
     R_ARM_THM_PC22 = 10
     R_ARM_CALL = 28
     R_ARM_JUMP24 = 29
-    R_ARM_V4BX = 40
     R_ARM_TARGET1 = 38
+    R_ARM_V4BX = 40
     R_ARM_PREL31 = 42
 
     @classmethod
@@ -137,58 +166,23 @@ class RelocationType(IntEnum):
         return obj
 
 
-class RelocationEntry:
-    def __init__(self, off: int, symbol_index: int, type: RelocationType):
-        self.off = off
-        self.symbol_index = symbol_index
-        self.type = type
-
-    @classmethod
-    def from_reader(cls, reader: BinaryReader) -> "RelocationEntry":
-        off = reader.read_u32()
-        tmp = reader.read_u32()
-        return cls(off, tmp >> 8, RelocationType(tmp & 0xFF))
-
-    def write(self, writer: BinaryWriter):
-        writer.write_u32(self.off)
-        writer.write_u32((self.symbol_index << 8) | (self.type & 0xFF))
-
-
-class Bitmask:
-    def __init__(self, length: int):
-        self.mask = bytearray(b'\xFF' * length)
-
-    def add_relocation(self, rel_entry: RelocationEntry):
-        match rel_entry.type:
-            case RelocationType.R_ARM_NONE:
-                pass  # marker reloc (e.g. armcc library references), no bytes affected
-            case RelocationType.R_ARM_CALL | RelocationType.R_ARM_JUMP24:
-                self.mask[rel_entry.off: rel_entry.off + 3] = b'\x00' * 3
-            case RelocationType.R_ARM_THM_PC22:
-                self.mask[rel_entry.off: rel_entry.off + 4] = b'\x00' * 4
-            case RelocationType.R_ARM_ABS32 | RelocationType.R_ARM_REL32 | RelocationType.R_ARM_TARGET1 | RelocationType.R_ARM_PREL31:
-                self.mask[rel_entry.off: rel_entry.off + 4] = b'\x00' * 4
-            case _:
-                self.mask[rel_entry.off: rel_entry.off + 4] = b'\x00' * 4
-
-    def extend(self, mask: "Bitmask"):
-        self.mask.extend(mask.mask)
-
-    def copy(self) -> "Bitmask":
-        cpy = Bitmask(0)
-        cpy.mask = self.mask.copy()
-        return cpy
-
-
 def get_name(data: bytes, off: int) -> str:
+    """The NUL-terminated string starting at `off` in a string table."""
     end = data.index(b'\x00', off)
     return data[off:end].decode('utf-8')
 
 
 def pad_to_4(writer: BinaryWriter):
+    """Zero-pad the writer up to the next 4-byte boundary."""
     while writer.tell() % 4 != 0:
         writer.write_u8(0)
 
 
 def sanitize(name: str) -> str:
+    """Make a symbol name safe to use as a file name on every platform."""
     return re.sub(r'[<>:"/\\|?*`()\']', '_', name)
+
+
+def posix(p: Path | str) -> str:
+    """A path with forward slashes, as build.ninja and objdiff.json want."""
+    return str(p).replace('\\', '/')

@@ -16,8 +16,9 @@
  * 51 s at 128 KB, 210 s at 256 KB), so pairing New Leaf's whole 1.13 MB
  * .rodata would take over an hour. `generate_target_elfs` keeps that from
  * happening by routing every data symbol the project has not actually
- * decompiled into a `.rodata.undecompiled` section, which nothing here emits
- * and objdiff therefore never pairs or diffs.
+ * decompiled into an `.undecompiled` section, which nothing here emits and
+ * objdiff therefore never pairs or diffs. (Not `.rodata.undecompiled`:
+ * objdiff folds a dotted suffix back into its parent section.)
  *
  * Writable data goes to .data on the same terms. Most decompiled data is
  * writable rather than const -- on ikachan 90 of 110 objects, including the

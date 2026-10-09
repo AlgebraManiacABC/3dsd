@@ -1,6 +1,9 @@
+"""Readers and writers for 3DS container formats: the ExHeader and CRO modules."""
+
+import dataclasses
 import hashlib
 from enum import IntEnum
-from typing import TypeVar, Generic
+from typing import Generic, TypeVar
 
 try:
     from typing import override  # Python 3.12+
@@ -9,11 +12,18 @@ except ImportError:
         return func
 
 from .util import (
-    BinaryReader, BinaryWriter, Writable, WritableStr, WritableBytes, RelocationType,
+    BinaryReader,
+    BinaryWriter,
+    PipelineError,
+    RelocationType,
+    Writable,
+    WritableBytes,
+    WritableStr,
 )
 
 
 class CTRSectionType(IntEnum):
+    """Segment index used by the ExHeader and CRO segment tables."""
     TEXT = 0
     RODATA = 1
     DATA = 2
@@ -21,6 +31,8 @@ class CTRSectionType(IntEnum):
 
 
 class OffSize:
+    """An (offset, size) pair, the unit every CRO header table is described by."""
+
     def __init__(self, off: int, size: int):
         self.off = off
         self.size = size
@@ -38,11 +50,14 @@ T = TypeVar("T", bound=Writable)
 
 
 class OffObject(Generic[T]):
+    """A value, or list of values, that lives at a fixed offset in the file."""
+
     def __init__(self, off: int, obj: T | list[T]):
         self.off = off
         self.obj = obj
 
     def write(self, writer: BinaryWriter):
+        """Write the value at its own offset, leaving the writer where it was."""
         ret = writer.tell()
         to_write = self.obj if isinstance(self.obj, list) else [self.obj]
         writer.seek(self.off)
@@ -51,33 +66,49 @@ class OffObject(Generic[T]):
         writer.seek(ret)
 
     def get_size(self, elem_size: int):
+        """Size in elements, or in bytes for a list of strings."""
         if elem_size == 1 and self.obj and isinstance(self.obj[0], WritableStr):
             return sum(len(s) + 1 for s in self.obj)
         return len(self.obj) * elem_size
 
-    def as_OffSize(self, elem_size: int = 1) -> OffSize:
+    def as_off_size(self, elem_size: int = 1) -> OffSize:
         return OffSize(self.off, self.get_size(elem_size))
 
 
 class CTRSectionInfo(OffSize):
-    def __init__(self, addr: int, size: int, type: CTRSectionType):
+    """One segment: its address, size and which kind of segment it is.
+
+    `pages` is the number of 4 KB pages an ExHeader code set occupies; the
+    next code set starts after them. Zero for CRO segments, which have none.
+    """
+
+    def __init__(self, addr: int, size: int, sec_type: CTRSectionType, pages: int = 0):
         super().__init__(addr, size)
-        self.type = type
+        self.type = sec_type
+        self.pages = pages
 
     @classmethod
-    def from_reader_with_type(cls, reader: BinaryReader, type: CTRSectionType) -> "CTRSectionInfo":
+    def from_exheader(cls, reader: BinaryReader, off: int,
+                      sec_type: CTRSectionType) -> "CTRSectionInfo":
+        """Read an ExHeader code-set entry: address, page count, byte size."""
+        reader.seek(off)
         addr = reader.read_u32()
-        reader.read_u32()
+        pages = reader.read_u32()
         size = reader.read_u32()
-        reader.read_u32()
-        return cls(addr, size, type)
+        return cls(addr, size, sec_type, pages)
+
+    @property
+    def page_end(self) -> int:
+        """First address after the pages this code set occupies."""
+        return self.off + self.pages * 0x1000
 
     @classmethod
     def from_cro_reader(cls, reader: BinaryReader) -> "CTRSectionInfo":
+        """Read a CRO segment table entry (offset, size, type)."""
         addr = reader.read_u32()
         size = reader.read_u32()
-        type = CTRSectionType(reader.read_u32())
-        return cls(addr, size, type)
+        sec_type = CTRSectionType(reader.read_u32())
+        return cls(addr, size, sec_type)
 
     @override
     def write(self, writer: BinaryWriter):
@@ -87,6 +118,13 @@ class CTRSectionInfo(OffSize):
 
 
 class ExHeader:
+    """The code-set layout from an extended header (exheader.bin).
+
+    Layout per https://www.3dbrew.org/wiki/NCCH/Extended_Header: three
+    12-byte code sets at 0x10 (text), 0x20 (read-only) and 0x30 (data), each
+    followed by an unrelated word (stack size, reserved, BSS size).
+    """
+
     def __init__(self, text, rodata, data, bss):
         self.text: CTRSectionInfo = text
         self.rodata: CTRSectionInfo = rodata
@@ -95,15 +133,34 @@ class ExHeader:
 
     @classmethod
     def from_reader(cls, reader: BinaryReader) -> "ExHeader":
-        reader.seek(0x10)
-        text = CTRSectionInfo.from_reader_with_type(reader, CTRSectionType.TEXT)
-        rodata = CTRSectionInfo.from_reader_with_type(reader, CTRSectionType.RODATA)
-        data = CTRSectionInfo.from_reader_with_type(reader, CTRSectionType.DATA)
+        text = CTRSectionInfo.from_exheader(reader, 0x10, CTRSectionType.TEXT)
+        rodata = CTRSectionInfo.from_exheader(reader, 0x20, CTRSectionType.RODATA)
+        data = CTRSectionInfo.from_exheader(reader, 0x30, CTRSectionType.DATA)
+        reader.seek(0x3C)
+        # BSS has no code set of its own: it starts right after the data bytes.
         bss = CTRSectionInfo(data.off + data.size, reader.read_u32(), CTRSectionType.BSS)
         return cls(text, rodata, data, bss)
 
+    def segment_of(self, addr: int) -> str | None:
+        """The segment an absolute address really lies in, or None if outside.
+
+        The page padding after .text and .rodata belongs to them; .data ends at
+        its last byte, where .bss begins.
+        """
+        if self.text.off <= addr < self.text.page_end:
+            return '.text'
+        if self.rodata.off <= addr < self.rodata.page_end:
+            return '.rodata'
+        if self.data.off <= addr < self.bss.off:
+            return '.data'
+        if self.bss.off <= addr < self.bss.off + self.bss.size:
+            return '.bss'
+        return None
+
 
 class SegmentOffset:
+    """A CRO segment-relative address: 4-bit segment index, 28-bit offset."""
+
     def __init__(self, seg_idx: int, seg_off: int):
         self.index = seg_idx
         self.off = seg_off
@@ -118,6 +175,8 @@ class SegmentOffset:
 
 
 class NamedExportTableEntry:
+    """A CRO export by name."""
+
     def __init__(self, name: OffObject, seg_off: SegmentOffset):
         self.name = name
         self.seg_off = seg_off
@@ -138,6 +197,8 @@ class NamedExportTableEntry:
 
 
 class ExportTrieEntry:
+    """A node of the CRO's export-name lookup trie."""
+
     def __init__(self, flags: int, left: int, right: int, index: int):
         self.flags = flags
         self.left = left
@@ -156,6 +217,8 @@ class ExportTrieEntry:
 
 
 class ImportModuleTableEntry:
+    """A module this CRO imports from, with its indexed and anonymous imports."""
+
     def __init__(self, name: OffObject, indexed: OffSize, anon: OffSize):
         self.name = name
         self.indexed = indexed
@@ -179,17 +242,19 @@ class ImportModuleTableEntry:
 
 
 class CRORelocationEntry:
-    def __init__(self, seg_off: SegmentOffset, type: RelocationType, misc):
+    """A CRO relocation: target, type and seven bytes of type-specific data."""
+
+    def __init__(self, seg_off: SegmentOffset, rel_type: RelocationType, misc):
         self.seg_off = seg_off
-        self.type = type
+        self.type = rel_type
         self.misc = misc
 
     @classmethod
     def from_reader(cls, reader: BinaryReader) -> "CRORelocationEntry":
         seg_off = SegmentOffset.from_reader(reader)
-        type = RelocationType(reader.read_u8())
+        rel_type = RelocationType(reader.read_u8())
         misc = reader.read_bytes(7)
-        return cls(seg_off, type, misc)
+        return cls(seg_off, rel_type, misc)
 
     def write(self, writer: BinaryWriter):
         self.seg_off.write(writer)
@@ -198,6 +263,8 @@ class CRORelocationEntry:
 
 
 class NamedImportTableEntry:
+    """A CRO import by name."""
+
     def __init__(self, name: OffObject, off: int):
         self.name = name
         self.off = off
@@ -218,6 +285,8 @@ class NamedImportTableEntry:
 
 
 class IndexedImportTableEntry:
+    """A CRO import by export index."""
+
     def __init__(self, index: int, off: int):
         self.index = index
         self.off = off
@@ -232,6 +301,8 @@ class IndexedImportTableEntry:
 
 
 class AnonImportTableEntry:
+    """A CRO import by segment offset."""
+
     def __init__(self, seg_off: SegmentOffset, off: int):
         self.seg_off = seg_off
         self.off = off
@@ -246,6 +317,8 @@ class AnonImportTableEntry:
 
 
 class UnknownRelocationInfo:
+    """An entry of the CRO table whose purpose is not yet understood."""
+
     def __init__(self, off: int, seg_off: SegmentOffset):
         self.off = off
         self.seg_off = seg_off
@@ -259,39 +332,79 @@ class UnknownRelocationInfo:
         self.seg_off.write(writer)
 
 
-class CRO:
-    def __init__(self, misc_info, cro_size, bss_size, misc_info_2,
-                 nnroCO, OnLoad, OnExit, OnUnresolved,
-                 text, data, module_name, segment_table,
-                 named_export_table, indexed_export_table, export_strings,
-                 export_trie, import_module_table, import_relocations,
-                 named_import_table, indexed_import_table, anon_import_table,
-                 import_strings, unk_reloc_base, internal_relocs, unk_relocs):
-        self.misc_info = misc_info
-        self.cro_size = cro_size
-        self.bss_size = bss_size
-        self.misc_info_2 = misc_info_2
-        self.nnroCO = nnroCO
-        self.OnLoad = OnLoad
-        self.OnExit = OnExit
-        self.OnUnresolved = OnUnresolved
-        self.text = text
-        self.data = data
-        self.module_name = module_name
-        self.segment_table = segment_table
-        self.named_export_table = named_export_table
-        self.indexed_export_table = indexed_export_table
-        self.export_strings = export_strings
-        self.export_trie = export_trie
-        self.import_module_table = import_module_table
-        self.import_relocations = import_relocations
-        self.named_import_table = named_import_table
-        self.indexed_import_table = indexed_import_table
-        self.anon_import_table = anon_import_table
-        self.import_strings = import_strings
-        self.unk_reloc_base = unk_reloc_base
-        self.internal_relocs = internal_relocs
-        self.unk_relocs = unk_relocs
+# How each CRO header table is read, in header order. A factory reads one list
+# element; the three string kinds are handled by `_read_table`.
+_BYTES, _STR, _STRINGS = 'bytes', 'str', 'strings'
+_CRO_TABLES = {
+    'text': _BYTES,
+    'data': _BYTES,
+    'module_name': _STR,
+    'segment_table': CTRSectionInfo.from_cro_reader,
+    'named_export_table': NamedExportTableEntry.from_reader,
+    'indexed_export_table': SegmentOffset.from_reader,
+    'export_strings': _STRINGS,
+    'export_trie': ExportTrieEntry.from_reader,
+    'import_module_table': ImportModuleTableEntry.from_reader,
+    'import_relocations': CRORelocationEntry.from_reader,
+    'named_import_table': NamedImportTableEntry.from_reader,
+    'indexed_import_table': IndexedImportTableEntry.from_reader,
+    'anon_import_table': AnonImportTableEntry.from_reader,
+    'import_strings': _STRINGS,
+    'unk_reloc_base': UnknownRelocationInfo.from_reader,
+    'internal_relocs': CRORelocationEntry.from_reader,
+    'unk_relocs': CRORelocationEntry.from_reader,
+}
+
+
+def _read_table(reader: BinaryReader, info: OffSize, kind) -> OffObject:
+    """Read one header table described by `info`."""
+    reader.seek(info.off)
+    if kind == _BYTES:
+        return OffObject(info.off, WritableBytes(reader.read_bytes(info.size)))
+    if kind == _STR:
+        return OffObject(info.off, WritableStr(reader.read_bytes(info.size).decode('utf-8')))
+    if kind == _STRINGS:
+        result, remaining = [], info.size
+        while remaining > 0:
+            s = reader.read_str()
+            remaining -= len(s) + 1
+            result.append(WritableStr(s))
+        return OffObject(info.off, result)
+    return OffObject(info.off, [kind(reader) for _ in range(info.size)])
+
+
+@dataclasses.dataclass
+class CRO:  # pylint: disable=too-many-instance-attributes
+    """A CRO module, parsed far enough to swap its code and write it back.
+
+    Field order is the on-disk header order; the tables after the four entry
+    points are exactly the keys of `_CRO_TABLES`.
+    """
+    misc_info: bytes
+    cro_size: int
+    bss_size: int
+    misc_info_2: bytes
+    nnro_control_object: SegmentOffset
+    on_load: SegmentOffset
+    on_exit: SegmentOffset
+    on_unresolved: SegmentOffset
+    text: OffObject
+    data: OffObject
+    module_name: OffObject
+    segment_table: OffObject
+    named_export_table: OffObject
+    indexed_export_table: OffObject
+    export_strings: OffObject
+    export_trie: OffObject
+    import_module_table: OffObject
+    import_relocations: OffObject
+    named_import_table: OffObject
+    indexed_import_table: OffObject
+    anon_import_table: OffObject
+    import_strings: OffObject
+    unk_reloc_base: OffObject
+    internal_relocs: OffObject
+    unk_relocs: OffObject
 
     def get_text_bytes(self) -> bytes:
         return self.text.obj
@@ -299,102 +412,45 @@ class CRO:
     def get_data_bytes(self) -> bytes:
         return self.data.obj
 
+    def _tables(self) -> list[OffObject]:
+        return [getattr(self, name) for name in _CRO_TABLES]
+
     @classmethod
     def from_reader(cls, reader: BinaryReader) -> "CRO":
+        """Parse a CRO module from the start of `reader`."""
         reader.seek(0x80)
-        magic = reader.read_bytes(4)
-        if magic != b'CRO0':
-            raise Exception("Invalid CRO0 format!")
-        misc_info = reader.read_bytes(0xC)
-        cro_size = reader.read_u32()
-        bss_size = reader.read_u32()
-        misc_info_2 = reader.read_bytes(0x8)
-        nnroCO = SegmentOffset.from_reader(reader)
-        OnLoad = SegmentOffset.from_reader(reader)
-        OnExit = SegmentOffset.from_reader(reader)
-        OnUnresolved = SegmentOffset.from_reader(reader)
-        text_info = OffSize.from_reader(reader)
-        data_info = OffSize.from_reader(reader)
-        module_name_info = OffSize.from_reader(reader)
-        segment_table_info = OffSize.from_reader(reader)
-        named_export_table_info = OffSize.from_reader(reader)
-        indexed_export_table_info = OffSize.from_reader(reader)
-        export_strings_info = OffSize.from_reader(reader)
-        export_trie_info = OffSize.from_reader(reader)
-        import_module_table_info = OffSize.from_reader(reader)
-        import_relocations_info = OffSize.from_reader(reader)
-        named_import_table_info = OffSize.from_reader(reader)
-        indexed_import_table_info = OffSize.from_reader(reader)
-        anon_import_table_info = OffSize.from_reader(reader)
-        import_strings_info = OffSize.from_reader(reader)
-        unk_reloc_base_info = OffSize.from_reader(reader)
-        internal_reloc_info = OffSize.from_reader(reader)
-        unk_reloc_info = OffSize.from_reader(reader)
-
-        def read_list(info, factory):
-            reader.seek(info.off)
-            return OffObject(info.off, [factory(reader) for _ in range(info.size)])
-
-        def read_strings(info):
-            reader.seek(info.off)
-            result, remaining = [], info.size
-            while remaining > 0:
-                s = reader.read_str()
-                remaining -= len(s) + 1
-                result.append(WritableStr(s))
-            return OffObject(info.off, result)
-
-        reader.seek(text_info.off)
-        text = OffObject(text_info.off, WritableBytes(reader.read_bytes(text_info.size)))
-        reader.seek(data_info.off)
-        data = OffObject(data_info.off, WritableBytes(reader.read_bytes(data_info.size)))
-        reader.seek(module_name_info.off)
-        module_name = OffObject(module_name_info.off,
-                                WritableStr(reader.read_bytes(module_name_info.size).decode('utf-8')))
-        segment_table = read_list(segment_table_info, CTRSectionInfo.from_cro_reader)
-        named_export_table = read_list(named_export_table_info, NamedExportTableEntry.from_reader)
-        reader.seek(indexed_export_table_info.off)
-        indexed_export_table = OffObject(indexed_export_table_info.off,
-                                         [SegmentOffset.from_reader(reader) for _ in range(indexed_export_table_info.size)])
-        export_strings = read_strings(export_strings_info)
-        export_trie = read_list(export_trie_info, ExportTrieEntry.from_reader)
-        import_module_table = read_list(import_module_table_info, ImportModuleTableEntry.from_reader)
-        import_relocations = read_list(import_relocations_info, CRORelocationEntry.from_reader)
-        named_import_table = read_list(named_import_table_info, NamedImportTableEntry.from_reader)
-        indexed_import_table = read_list(indexed_import_table_info, IndexedImportTableEntry.from_reader)
-        anon_import_table = read_list(anon_import_table_info, AnonImportTableEntry.from_reader)
-        import_strings = read_strings(import_strings_info)
-        unk_reloc_base = read_list(unk_reloc_base_info, UnknownRelocationInfo.from_reader)
-        internal_relocs = read_list(internal_reloc_info, CRORelocationEntry.from_reader)
-        unk_relocs = read_list(unk_reloc_info, CRORelocationEntry.from_reader)
-
-        return cls(misc_info, cro_size, bss_size, misc_info_2,
-                   nnroCO, OnLoad, OnExit, OnUnresolved, text, data,
-                   module_name, segment_table, named_export_table, indexed_export_table,
-                   export_strings, export_trie, import_module_table, import_relocations,
-                   named_import_table, indexed_import_table, anon_import_table,
-                   import_strings, unk_reloc_base, internal_relocs, unk_relocs)
+        if reader.read_bytes(4) != b'CRO0':
+            raise PipelineError(f"{reader.name}: not a CRO module (no CRO0 magic)")
+        header = {
+            'misc_info': reader.read_bytes(0xC),
+            'cro_size': reader.read_u32(),
+            'bss_size': reader.read_u32(),
+            'misc_info_2': reader.read_bytes(0x8),
+            'nnro_control_object': SegmentOffset.from_reader(reader),
+            'on_load': SegmentOffset.from_reader(reader),
+            'on_exit': SegmentOffset.from_reader(reader),
+            'on_unresolved': SegmentOffset.from_reader(reader),
+        }
+        infos = {name: OffSize.from_reader(reader) for name in _CRO_TABLES}
+        tables = {name: _read_table(reader, infos[name], kind)
+                  for name, kind in _CRO_TABLES.items()}
+        return cls(**header, **tables)
 
     def write(self, writer: BinaryWriter):
+        """Serialise the module, padding to `cro_size` and rehashing the header."""
         writer.seek(0x80)
         writer.write_bytes(b'CRO0')
         writer.write_bytes(self.misc_info)
         writer.write_u32(self.cro_size)
         writer.write_u32(self.bss_size)
         writer.write_bytes(self.misc_info_2)
-        for seg_off in [self.nnroCO, self.OnLoad, self.OnExit, self.OnUnresolved]:
+        for seg_off in [self.nnro_control_object, self.on_load, self.on_exit,
+                        self.on_unresolved]:
             seg_off.write(writer)
-        for tbl in [self.text, self.data, self.module_name, self.segment_table,
-                     self.named_export_table, self.indexed_export_table, self.export_strings,
-                     self.export_trie, self.import_module_table, self.import_relocations,
-                     self.named_import_table, self.indexed_import_table, self.anon_import_table,
-                     self.import_strings, self.unk_reloc_base, self.internal_relocs, self.unk_relocs]:
-            tbl.as_OffSize().write(writer)
-        for tbl in [self.text, self.data, self.module_name, self.segment_table,
-                     self.named_export_table, self.indexed_export_table, self.export_strings,
-                     self.export_trie, self.import_module_table, self.import_relocations,
-                     self.named_import_table, self.indexed_import_table, self.anon_import_table,
-                     self.import_strings, self.unk_reloc_base, self.internal_relocs, self.unk_relocs]:
+        tables = self._tables()
+        for tbl in tables:
+            tbl.as_off_size().write(writer)
+        for tbl in tables:
             tbl.write(writer)
 
         cur_size = len(writer.getvalue())
@@ -402,32 +458,26 @@ class CRO:
         writer.write_bytes(b'\xCC' * (self.cro_size - cur_size))
 
         writer.seek(0)
-        for bounds in [(0x80, self.text.off),
-                       (self.text.off, self.module_name.off),
-                       (self.module_name.off, self.data.off),
-                       (self.data.off, self.data.off + self.data.as_OffSize().size)]:
-            sha256 = hashlib.sha256(writer.getvalue()[bounds[0]:bounds[1]]).digest()
-            writer.write_bytes(sha256)
+        for start, end in [(0x80, self.text.off),
+                           (self.text.off, self.module_name.off),
+                           (self.module_name.off, self.data.off),
+                           (self.data.off, self.data.off + self.data.as_off_size().size)]:
+            writer.write_bytes(hashlib.sha256(writer.getvalue()[start:end]).digest())
 
     @classmethod
     def from_cro(cls, cro: "CRO", data: bytes) -> "CRO":
+        """A copy of `cro` with its code replaced by `data`, trimmed to fit."""
         data = bytearray(data)[:len(cro.text.obj)]
-        text_section = OffObject(cro.text.off, WritableBytes(data))
-        return cls(cro.misc_info, cro.cro_size, cro.bss_size, cro.misc_info_2,
-                   cro.nnroCO, cro.OnLoad, cro.OnExit, cro.OnUnresolved,
-                   text_section, cro.data, cro.module_name, cro.segment_table,
-                   cro.named_export_table, cro.indexed_export_table,
-                   cro.export_strings, cro.export_trie, cro.import_module_table,
-                   cro.import_relocations, cro.named_import_table,
-                   cro.indexed_import_table, cro.anon_import_table,
-                   cro.import_strings, cro.unk_reloc_base,
-                   cro.internal_relocs, cro.unk_relocs)
+        return dataclasses.replace(cro, text=OffObject(cro.text.off, WritableBytes(data)))
 
 
 class CTRBinary:
-    def __init__(self, name: str, binary: bytes | CRO, exh: ExHeader = None):
+    """An original binary -- code.bin or a CRO -- as the pipeline sees it."""
+
+    def __init__(self, name: str, binary: bytes | CRO, exh: ExHeader | None = None):
         self.name = name
         self.binary = binary
+        self.exheader = exh
         if isinstance(binary, CRO):
             self.data = self.binary.get_text_bytes() + self.binary.get_data_bytes()
             self.base_addr = self.binary.text.off
