@@ -4,6 +4,10 @@ Notes from making the pipeline handle real translation units — a `.c` or `.cpp
 file holding many functions — instead of only one-function-per-file with the
 file named after the symbol.
 
+This is a record of that change as it was made. Several of the limitations it
+ends on have been resolved since; see [Known limitations](#known-limitations)
+for where each one stands now.
+
 ## What was actually broken
 
 `--split_sections` was never the problem. armcc splits a multi-function file
@@ -125,6 +129,13 @@ link because `.text` relocations point into it and objdiff needs those symbols
 to name what a load is reading. Making data actually count would be a real
 improvement, but it needs the objdiff side to get faster first.
 
+> **Since superseded.** Data now pairs: `base.ld` folds read-only data into
+> `.rodata` and writable data into `.data`, and the target side routes every
+> data symbol the project has *not* decompiled into an `.undecompiled` section
+> that the base never has. objdiff therefore only diffs the few KB that were
+> actually decompiled, which keeps the quadratic cost negligible. See the
+> header of `3dsd/base.ld` and `SKIP_SEGMENT` in `3dsd/objdiff.py`.
+
 ### 5. objdiff rejects armcc's R_ARM_NONE marker relocations
 
 armcc emits `R_ARM_NONE` entries at offset 0 to pin down which printf variant a
@@ -226,26 +237,31 @@ target counterpart do normally pair (Ikachan has such a case at 100 %), so the
 reason objdiff drops this particular one is unresolved. It makes no practical
 difference — unpaired and 40 % both mean "not done".
 
-## Known limitations, not addressed here
+## Known limitations
 
-**Literal pools fall outside symbol sizes.** `Item_Clear` compiles to 24 bytes
-— 20 of instructions plus a 4-byte `0x7ffe` literal — but the symbol CSV says
-20, so `split/code.bin/Item_Clear.o` is cut at 20 and the exact compare fails.
-The literal really does live at `Item_Clear+0x14` in the original; Ghidra just
-does not count it as part of the function. This affects 4 of the 14 New Leaf
-`Item` functions and is independent of file layout. objdiff is unaffected — it
-diffs instructions over the target symbol's extent and reports these as 100 %.
+These were open when this note was written. The first three have been
+resolved since.
 
-**objdiff's data diff is too slow to switch on.** See defect 4 — pairing a
-megabyte-scale `.rodata` costs 45 minutes rather than 16 seconds. Worth
-reporting upstream; until then the base ELF stays code-only in effect.
+**Literal pools fall outside symbol sizes.** *No longer applicable.*
+`Item_Clear` compiles to 24 bytes — 20 of instructions plus a 4-byte `0x7ffe`
+literal — but the symbol CSV says 20, so the pipeline's own per-function
+compare against `split/code.bin/Item_Clear.o` failed. That compare was later
+widened to the compiled extent, and then removed altogether: its verdict was
+never reported, and progress has always come from objdiff, which diffs over
+the target symbol's extent and scores these functions 100 %.
 
-**`.s` / `.S` sources need `armasm` on PATH.** `_gather_sources` accepts them
-and armcc dispatches to `armasm`, which is not resolved through the
-`compilers:` install root.
+**objdiff's data diff is too slow to switch on.** *Resolved* by pairing only
+decompiled data; see the note at the end of defect 4.
 
-**Duplicate global symbols still break the base link.** If two translation
-units genuinely define the same global, `ld -r` fails and no base ELF is
-produced. `3dsd objdiff` now warns when the base ELF is missing instead of
-silently reporting 0 %, but the underlying conflict is a real error in the
-sources and is left to the user to resolve.
+**`.s` / `.S` sources need `armasm` on PATH.** *Resolved.* armcc shells out to
+`armasm` for embedded assembler, and the compile now runs with the compiler's
+own `bin/` directory at the front of `PATH` (`_cc_env` in `3dsd/compiler.py`).
+
+**Duplicate global symbols still break the base link.** *Partly resolved.*
+Vague-linkage definitions — vtables, RTTI records, template instantiations —
+are emitted by every translation unit that needs them; armcc puts each in a
+COMDAT group, and the pipeline now recognises these and folds them instead of
+warning. A genuine duplicate strong definition still makes `ld -r` fail, and
+`3dsd objdiff` warns that the base ELF is missing rather than silently
+reporting 0 %. That conflict is a real error in the sources and is left to the
+user to resolve.

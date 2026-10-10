@@ -1,3 +1,6 @@
+"""Project loading: binaries, symbols, sources, dependencies and cc.yaml."""
+
+import contextlib
 import csv
 import fnmatch
 import json
@@ -9,8 +12,9 @@ from pathlib import Path
 
 import yaml
 
-from .ctrtype import CTRBinary, CRO, ExHeader
-from .util import BinaryReader, Symbol, sanitize
+from .compiler import SymbolInfo, compile_source, discover_symbols
+from .ctrtype import CRO, CTRBinary, ExHeader
+from .util import BinaryReader, PipelineError, Symbol, sanitize
 
 # Generated directory names, relative to the project working directory.
 # Shared with clean.py so the two cannot drift apart.
@@ -25,6 +29,8 @@ INCLUDE_DIR = 'include'
 # under this prefix so they cannot collide with a path under src/<binary>/.
 DEPS_DIR = 'deps'
 DEP_PREFIX = '_deps'
+
+SOURCE_SUFFIXES = {'.c', '.cpp', '.s', '.S'}
 
 
 class Dependency:
@@ -56,7 +62,7 @@ class Dependency:
         for d in self.source_dirs:
             base = self.root / d if d not in ('.', '') else self.root
             if not base.is_dir():
-                raise Exception(
+                raise PipelineError(
                     f"Dependency '{self.name}': source directory '{d}' does not "
                     f"exist under {self.root.as_posix()}")
             found += [f.relative_to(self.root).as_posix()
@@ -64,13 +70,11 @@ class Dependency:
         return sorted(set(found))
 
 
-SOURCE_SUFFIXES = {'.c', '.cpp', '.s', '.S'}
-
-
-class ProjectConfig:
+class ProjectConfig:  # pylint: disable=too-many-instance-attributes
     """Loaded project state: binaries, symbols, sources, compiler config, paths."""
 
-    def __init__(self, working_dir: Path, originals: list[Path],
+    def __init__(self, working_dir: Path,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                 originals: list[Path],
                  exheader: ExHeader | None,
                  binaries: dict[str, CTRBinary],
                  sources: dict[str, list[Path]],
@@ -94,14 +98,12 @@ class ProjectConfig:
         self.compilers = compilers or {}
         self.deps = deps or {}
         self._verified_ccs: set[str] = set()
-        # {binary: {symbol: compiled extent}}, filled by get_source_map and
-        # read by the ninja generator to size the comparison window.
-        self._compiled_sizes: dict[str, dict[str, int]] = {}
         # {binary: {src_key: {symbol: SymbolInfo}}}, one parse per object.
-        self._symbol_info: dict[str, dict[str, dict]] = {}
+        self._symbol_info: dict[str, dict[str, dict[str, SymbolInfo]]] = {}
 
     @classmethod
-    def load(cls, working_dir: Path, single_binary: str = None) -> "ProjectConfig":
+    def load(cls, working_dir: Path, single_binary: str | None = None) -> "ProjectConfig":
+        """Read the project at `working_dir`, optionally narrowed to one binary."""
         # Anchor the project absolutely before deriving anything from it. Two
         # different relative bases otherwise collide: paths built here are
         # relative to the caller's cwd, but the compile runs with cwd set to
@@ -129,7 +131,9 @@ class ProjectConfig:
 
         originals = [f for f in orig_dir.rglob('*') if f.is_file()]
         exh, binaries = _gather_binaries(orig_dir, single_binary)
-        cc_info = yaml.safe_load(cc_path.read_text())
+        cc_info = yaml.safe_load(cc_path.read_text()) or {}
+        if not isinstance(cc_info, dict):
+            raise PipelineError(f"{cc_path.name} must be a mapping of settings.")
         compilers = cc_info.pop('compilers', None) or {}
         # Popped before _resolve_cc_info so `dependencies:` is never mistaken for
         # a binary entry, exactly as `compilers:` is.
@@ -146,9 +150,11 @@ class ProjectConfig:
                 continue
             sym_list = _gather_symbols(f)
             bin_name = f.stem
-            # Before the addresses go relative, so the report quotes the same
-            # addresses the CSV and Ghidra do.
+            # Before the addresses go relative, so the reports quote the same
+            # addresses the CSV does.
             _check_unique_names(f, sym_list)
+            if bin_name in binaries and binaries[bin_name].exheader:
+                _apply_exheader_segments(f, sym_list, binaries[bin_name])
             if bin_name in binaries:
                 for sym in sym_list:
                     sym.addr -= binaries[bin_name].base_addr
@@ -197,7 +203,7 @@ class ProjectConfig:
         if not d:
             d = self.cc_info.get('default')
         if not d:
-            raise Exception(f"No compiler config for {source_name} and no default!")
+            raise PipelineError(f"No compiler config for {source_name} and no default!")
         cc_name = d['cc']
         flags = list(d.get('flags', []))
 
@@ -228,32 +234,17 @@ class ProjectConfig:
             install = Path(self.compilers[cc_name])
             if not install.is_absolute():
                 install = self.working_dir / install
-            cc = _find_executable(install / 'bin' / 'armcc')
-            if cc is None:
-                raise Exception(
-                    f"Compiler '{cc_name}': no armcc executable found under {install.resolve() / 'bin'}")
-            include = install / 'include'
-            if include.is_dir():
-                flags.append(f'-I{include.as_posix()}')
+            cc = _install_cc(cc_name, install, flags)
+        elif (self.tool_dir / cc_name).is_dir():
+            cc = _install_cc(cc_name, self.tool_dir / cc_name, flags)
+        elif (found := _find_executable(self.tool_dir / cc_name)) is not None:
+            cc = found
         else:
-            cc = self.tool_dir / cc_name
-            if cc.is_dir():
-                install = cc
-                cc = _find_executable(install / 'bin' / 'armcc')
-                if cc is None:
-                    raise Exception(
-                        f"Compiler '{cc_name}': no armcc executable in {install.resolve() / 'bin'}")
-                include = install / 'include'
-                if include.is_dir():
-                    flags.append(f'-I{include.as_posix()}')
-            elif (found := _find_executable(cc)) is not None:
-                cc = found
-            else:
-                raise Exception(
-                    f"Compiler '{cc_name}' not found in {self.tool_dir}.\n"
-                    f"  Set its install directory in cc.yaml, e.g.:\n"
-                    f"  compilers:\n"
-                    f"    {cc_name}: C:/path/to/armcc/4.1/b1049")
+            raise PipelineError(
+                f"Compiler '{cc_name}' not found in {self.tool_dir}.\n"
+                f"  Set its install directory in cc.yaml, e.g.:\n"
+                f"  compilers:\n"
+                f"    {cc_name}: C:/path/to/armcc/4.1/b1049")
 
         self._verify_cc(cc_name, cc)
         return cc, flags
@@ -273,23 +264,25 @@ class ProjectConfig:
         if m:
             version, build = m.groups()
             try:
-                r = subprocess.run([str(cc_path), '--vsn'],
-                                   capture_output=True, text=True, timeout=30)
+                r = subprocess.run([str(cc_path), '--vsn'], capture_output=True,
+                                   text=True, timeout=30, check=False)
             except OSError as e:
-                raise Exception(f"Cannot run compiler '{cc_path}': {e}")
+                raise PipelineError(f"Cannot run compiler '{cc_path}': {e}") from e
             text = (r.stdout or '') + (r.stderr or '')
             reported = text.strip().splitlines()[0] if text.strip() else '(no output)'
             if version not in text or f'Build {build}' not in text:
-                raise Exception(
+                raise PipelineError(
                     f"Compiler version mismatch for '{cc_name}':\n"
                     f"  expected {version} [Build {build}]\n"
                     f"  but {cc_path} reports: {reported}")
         self._verified_ccs.add(cc_name)
 
     def ld_path(self) -> Path:
+        """GNU ld in tools/ (extensionless; the OS supplies .exe)."""
         return self.tool_dir / 'ld'
 
     def objcopy_path(self) -> Path:
+        """GNU objcopy in tools/ (extensionless; the OS supplies .exe)."""
         return self.tool_dir / 'objcopy'
 
     def obj_path(self, bin_name: str, src_key: str) -> Path:
@@ -320,7 +313,7 @@ class ProjectConfig:
                     found[sanitize(name)] = info.segment
         return found
 
-    def _discovered_symbols(self, bin_name: str) -> dict[str, dict]:
+    def _discovered_symbols(self, bin_name: str) -> dict[str, dict[str, SymbolInfo]]:
         """`{src_key: {symbol: SymbolInfo}}` for every object already compiled.
 
         Cached because `get_source_map` and `get_decompiled_data` both want it
@@ -328,8 +321,6 @@ class ProjectConfig:
         exist yet are simply absent: this never compiles anything, it only
         reads what the discovery pass in `get_source_map` has already built.
         """
-        from .compare import discover_symbols
-
         cached = self._symbol_info.get(bin_name)
         if cached is not None:
             return cached
@@ -342,6 +333,44 @@ class ProjectConfig:
         self._symbol_info[bin_name] = cached
         return cached
 
+    def _refresh_discovery(self, bin_name: str, sources: dict[str, Path]):
+        """Compile every source whose discovery object is missing or stale.
+
+        The discovery object is also keyed on the compiler and flags: editing
+        cc.yaml must invalidate it, or section discovery silently runs against
+        an object built with the previous settings.
+        """
+        manifest_path = self.build_dir / bin_name / '.discovery.json'
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError):
+            manifest = {}
+
+        stale: list[tuple[str, Path, Path, Path, list[str], str]] = []
+        for key, src_path in sources.items():
+            build_o = self.obj_path(bin_name, key)
+            cc_path, flags = self.get_cc(bin_name, key)
+            cc_key = f'{cc_path}|{",".join(flags)}'
+            if (not build_o.exists()
+                    or build_o.stat().st_size == 0
+                    or src_path.stat().st_mtime > build_o.stat().st_mtime
+                    or manifest.get(key) != cc_key):
+                stale.append((key, src_path, build_o, cc_path, flags, cc_key))
+
+        if not stale:
+            return
+        print(f"  Scanning {len(stale)} source file(s) for symbols...")
+        with ThreadPoolExecutor(max_workers=_scan_workers()) as pool:
+            futures = [pool.submit(compile_source, src_path, build_o, cc_path, flags,
+                                   self.working_dir)
+                       for _key, src_path, build_o, cc_path, flags, _cc_key in stale]
+            for f in futures:
+                f.result()
+        for key, *_rest, cc_key in stale:
+            manifest[key] = cc_key
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(manifest, indent=1))
+
     def get_source_map(self, bin_name: str) -> dict[str, tuple[Path, str]]:
         """Return {sym_name: (source_path, src_key)} for every symbol a source
         provides.
@@ -352,47 +381,12 @@ class ProjectConfig:
         mangled name. Objects are cached in `build/`; only a missing, stale or
         differently-configured object is recompiled.
         """
-        from .compare import compile_source
-
         sources = {self.src_key(bin_name, s): s
                    for s in self.sources.get(bin_name, [])}
         all_syms = {sanitize(sym.name) for sym in self.symbols.get(bin_name, [])
                     if sym.addr >= 0}
 
-        # The discovery object is also keyed on the compiler and flags: editing
-        # cc.yaml must invalidate it, or section discovery silently runs against
-        # an object built with the previous settings.
-        manifest_path = self.build_dir / bin_name / '.discovery.json'
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, ValueError):
-            manifest = {}
-
-        stale: list[tuple[str, Path, Path, str]] = []
-        for key, src_path in sources.items():
-            build_o = self.obj_path(bin_name, key)
-            cc_path, flags = self.get_cc(bin_name, key)
-            cc_key = f'{cc_path}|{",".join(flags)}'
-            if (not build_o.exists()
-                    or build_o.stat().st_size == 0
-                    or src_path.stat().st_mtime > build_o.stat().st_mtime
-                    or manifest.get(key) != cc_key):
-                stale.append((key, src_path, build_o, cc_key))
-
-        if stale:
-            print(f"  Scanning {len(stale)} source file(s) for symbols...")
-            with ThreadPoolExecutor(max_workers=_scan_workers()) as pool:
-                futures = []
-                for key, src_path, build_o, cc_key in stale:
-                    cc_path, flags = self.get_cc(bin_name, key)
-                    futures.append(pool.submit(compile_source, src_path, build_o,
-                                               cc_path, flags, self.working_dir))
-                for f in futures:
-                    f.result()
-            for key, _src, _o, cc_key in stale:
-                manifest[key] = cc_key
-            manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps(manifest, indent=1))
+        self._refresh_discovery(bin_name, sources)
 
         # Objects have just been brought up to date, so this is the parse.
         # Anything absent from it failed to compile: the file can still claim
@@ -401,11 +395,9 @@ class ProjectConfig:
         symbols_by_key = self._discovered_symbols(bin_name)
 
         discovered: dict[str, list[str]] = {}
-        sizes_by_key: dict[str, dict[str, int]] = {}
         vague_by_key: dict[str, set[str]] = {}
         for key in sorted(sources):
             info = symbols_by_key.get(key, {})
-            sizes_by_key[key] = {sanitize(n): i.extent for n, i in info.items()}
             vague_by_key[key] = {sanitize(n) for n, i in info.items() if i.vague}
             discovered[key] = [sanitize(n) for n in info]
             # A dependency file contributing nothing is normal -- a game uses
@@ -418,71 +410,13 @@ class ProjectConfig:
                     and not key.startswith(f'{DEP_PREFIX}/')):
                 print(f"  Warning: {key} defines no symbols.")
 
-        result: dict[str, tuple[Path, str]] = {}
-        owner: dict[str, str] = {}
-        folded: list[str] = []
-
-        def claim(sym: str, key: str):
-            if sym not in all_syms:
-                return
-            if sym in owner:
-                if owner[sym] != key:
-                    # A vtable, an RTTI record or a template instantiation is
-                    # emitted by every translation unit that needs it, and the
-                    # linker folds the copies into the one the original binary
-                    # has. Both sides being vague-linkage means the duplication
-                    # is C++ working as specified, so it is counted, not warned
-                    # about; a strong definition on either side is a real clash.
-                    if (sym in vague_by_key.get(key, ())
-                            and sym in vague_by_key.get(owner[sym], ())):
-                        folded.append(sym)
-                        return
-                    print(f"  Warning: {sym} is defined by both {owner[sym]} "
-                          f"and {key}; keeping {owner[sym]}.")
-                return
-            owner[sym] = key
-            result[sym] = (sources[key], key)
-
-        # A file named after a symbol owns it, even if another translation unit
-        # also happens to define it. Only then are the remaining sections of
-        # each file handed out, so adding a multi-function file cannot quietly
-        # take symbols away from the files dedicated to them.
-        #
-        # The project's own sources go first in both passes: a vendored file
-        # must never take a symbol away from the file the project wrote for it.
-        # Sort order cannot express this -- '_' falls between the upper and
-        # lower case letters -- so the two origins are partitioned explicitly.
-        own = sorted(k for k in sources if not k.startswith(f'{DEP_PREFIX}/'))
+        owner = _assign_owners(sources, discovered, vague_by_key, all_syms)
         vendored = sorted(k for k in sources if k.startswith(f'{DEP_PREFIX}/'))
-        for group in (own, vendored):
-            for key in group:
-                claim(sanitize(sources[key].stem), key)
-            for key in group:
-                for sym in discovered[key]:
-                    claim(sym, key)
-
-        if folded:
-            print(f"  Folded {len(folded)} duplicate definition(s) of "
-                  f"{len(set(folded))} vague-linkage symbol(s).")
-
-        # Record how far each claimed symbol reaches once compiled. A function's
-        # literal pool sits between it and whatever follows, so this is often
-        # longer than the size the symbol CSV gives.
-        compiled = self._compiled_sizes.setdefault(bin_name, {})
-        for sym, key in owner.items():
-            size = (sizes_by_key.get(key) or {}).get(sym)
-            if size:
-                compiled[sym] = size
-
         self._report_deps(bin_name, vendored, discovered, owner)
-        return result
-
-    def compiled_size(self, bin_name: str, sym: str) -> int | None:
-        """Length of `sym` as the compiler emits it, if it has been discovered."""
-        return self._compiled_sizes.get(bin_name, {}).get(sym)
+        return {sym: (sources[key], key) for sym, key in owner.items()}
 
     def _report_deps(self, bin_name: str, vendored: list[str],
-                          discovered: dict[str, list[str]], owner: dict[str, str]):
+                     discovered: dict[str, list[str]], owner: dict[str, str]):
         """One summary line per dependency, instead of per-file warnings.
 
         A dependency usually defines far more than any one game uses, so a file
@@ -501,6 +435,59 @@ class ProjectConfig:
             rev = f' @{dep.revision}' if dep.revision else ''
             print(f"  {name}{rev}: {claimed} of {found} discovered symbols "
                   f"are in symbols/{bin_name}.csv")
+
+
+def _assign_owners(sources: dict[str, Path], discovered: dict[str, list[str]],
+                   vague_by_key: dict[str, set[str]], all_syms: set[str]) -> dict[str, str]:
+    """Decide which source owns each symbol: `{symbol: src_key}`.
+
+    A file named after a symbol owns it, even if another translation unit
+    also happens to define it. Only then are the remaining sections of each
+    file handed out, so adding a multi-function file cannot quietly take
+    symbols away from the files dedicated to them.
+
+    The project's own sources go first in both passes: a vendored file must
+    never take a symbol away from the file the project wrote for it. Sort
+    order cannot express this -- '_' falls between the upper and lower case
+    letters -- so the two origins are partitioned explicitly.
+    """
+    owner: dict[str, str] = {}
+    folded: list[str] = []
+
+    def claim(sym: str, key: str):
+        if sym not in all_syms:
+            return
+        if sym not in owner:
+            owner[sym] = key
+            return
+        if owner[sym] == key:
+            return
+        # A vtable, an RTTI record or a template instantiation is emitted by
+        # every translation unit that needs it, and the linker folds the
+        # copies into the one the original binary has. Both sides being
+        # vague-linkage means the duplication is C++ working as specified, so
+        # it is counted, not warned about; a strong definition on either side
+        # is a real clash.
+        if sym in vague_by_key.get(key, ()) and sym in vague_by_key.get(owner[sym], ()):
+            folded.append(sym)
+            return
+        print(f"  Warning: {sym} is defined by both {owner[sym]} "
+              f"and {key}; keeping {owner[sym]}.")
+
+    own = sorted(k for k in sources if not k.startswith(f'{DEP_PREFIX}/'))
+    vendored = sorted(k for k in sources if k.startswith(f'{DEP_PREFIX}/'))
+    for group in (own, vendored):
+        for key in group:
+            claim(sanitize(sources[key].stem), key)
+        for key in group:
+            for sym in discovered[key]:
+                claim(sym, key)
+
+    if folded:
+        print(f"  Folded {len(folded)} duplicate definition(s) of "
+              f"{len(set(folded))} vague-linkage symbol(s).")
+    return owner
+
 
 def _check_unique_names(sym_path: Path, symbols: list[Symbol]) -> None:
     """Reject a symbol CSV that names two symbols the same.
@@ -526,8 +513,8 @@ def _check_unique_names(sym_path: Path, symbols: list[Symbol]) -> None:
 
     total = sum(len(g) for g in clashes)
     lines = [
-        f"Duplicate symbol names in {sym_path.name}: "
-        f"{total:,} symbols share {len(clashes):,} names.",
+        (f"Duplicate symbol names in {sym_path.name}: "
+         f"{total:,} symbols share {len(clashes):,} names."),
         "  A name is a symbol's identity here: it becomes the split object's",
         "  filename and the symbol inside it. Duplicates overwrite each other",
         "  during the split -- losing the original bytes of all but the last --",
@@ -546,21 +533,56 @@ def _check_unique_names(sym_path: Path, symbols: list[Symbol]) -> None:
         "  leave labels that cannot be named uniquely out of the CSV entirely:",
         "  the pipeline already covers unnamed regions by address.",
     ]
-    raise Exception('\n'.join(lines))
+    raise PipelineError('\n'.join(lines))
 
 
-def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
+def _apply_exheader_segments(sym_path: Path, symbols: list[Symbol],
+                             binary: CTRBinary) -> None:
+    """Take each symbol's segment from where the exheader says it lies.
+
+    The CSV's Segment column is a label someone chose, while the exheader is
+    the binary's real layout, and the round-trip depends on the two agreeing:
+    the split names each object's section after its segment, and linker.ld
+    gathers every .rodata input before every .data one. A .data label inside
+    the read-only pages therefore moves that object after all the .rodata
+    ones and shifts every byte that follows -- a failed verify, not an error.
+
+    Progress is unaffected either way: decompiled data pairs in whichever
+    section the compiler put it (`_route_data` in objdiff.py). Disagreements
+    are reported so the CSV can be corrected at its source.
+    """
+    end = binary.base_addr + len(binary.data)
+    changed = []
+    for sym in symbols:
+        if not binary.base_addr <= sym.addr < end:
+            continue  # zero-initialised: no bytes, nothing to place
+        real = binary.exheader.segment_of(sym.addr)
+        # A .bss address still inside the file is page padding after .data;
+        # writing it as .bss (no bytes) would drop those bytes from the relink.
+        if real in ('.text', '.rodata', '.data') and real != sym.segment:
+            changed.append(f"{sym.name} at {sym.addr:08x}: {sym.segment} -> {real}")
+            sym.segment = real
+    if changed:
+        print(f"  Warning: {len(changed)} segment label(s) in {sym_path.name} disagree "
+              f"with the exheader; using the exheader:")
+        for line in changed[:10]:
+            print(f"    {line}")
+        if len(changed) > 10:
+            print(f"    ... and {len(changed) - 10} more")
+
+
+def _load_deps(dep_info: dict | None, working_dir: Path) -> dict[str, Dependency]:
     """Build the Dependency objects declared under cc.yaml's `dependencies:` key."""
     deps: dict[str, Dependency] = {}
     for name, entry in (dep_info or {}).items():
         if not isinstance(entry, dict):
-            raise Exception(
+            raise PipelineError(
                 f"Dependency '{name}' in cc.yaml must be a mapping, not "
                 f"{type(entry).__name__}.")
 
         root = working_dir / DEPS_DIR / name
         if not root.is_dir():
-            raise Exception(
+            raise PipelineError(
                 f"Dependency '{name}' is declared in cc.yaml but "
                 f"{root.as_posix()} does not exist.\n"
                 f"  If it is a git submodule, initialise it:\n"
@@ -569,7 +591,7 @@ def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
         # with the real contents ignored or not yet checked out, is empty for
         # every purpose that matters here.
         if not any(p for p in root.iterdir() if not p.name.startswith('.')):
-            raise Exception(
+            raise PipelineError(
                 f"Dependency '{name}' at {root.as_posix()} is empty -- this is "
                 f"usually an uninitialised submodule.\n"
                 f"  Populate it with:\n"
@@ -578,13 +600,13 @@ def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
         # (ninja.py / __main__.py), so a comma in an -I path would silently
         # tear the command line in half.
         if ',' in root.as_posix():
-            raise Exception(
+            raise PipelineError(
                 f"Dependency '{name}': the path {root.as_posix()} contains a "
                 f"comma, which cannot be passed through the compile rule's "
                 f"flag list. Rename the directory.")
 
         if 'sources' not in entry:
-            raise Exception(
+            raise PipelineError(
                 f"Dependency '{name}' must declare `sources:` -- a list of "
                 f"directories under {DEPS_DIR}/{name} to compile (use [] for a "
                 f"headers-only reference). Nothing is inferred from the "
@@ -593,7 +615,7 @@ def _load_deps(dep_info: dict, working_dir: Path) -> dict[str, "Dependency"]:
         include_dirs = list(entry.pop('include', None) or [])
         for d in include_dirs:
             if not (root / d).is_dir():
-                raise Exception(
+                raise PipelineError(
                     f"Dependency '{name}': include directory '{d}' does not exist "
                     f"under {root.as_posix()}")
 
@@ -607,7 +629,7 @@ def _git_revision(root: Path) -> str | None:
     """Short HEAD of a checkout, or None. Read-only and best-effort."""
     try:
         r = subprocess.run(['git', '-C', str(root), 'rev-parse', '--short', 'HEAD'],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0:
@@ -616,7 +638,7 @@ def _git_revision(root: Path) -> str | None:
 
 
 def _binary_deps(cc_info: dict, bin_name: str,
-                      deps: dict[str, "Dependency"]) -> list["Dependency"]:
+                 deps: dict[str, Dependency]) -> list[Dependency]:
     """The dependencies a binary declares it consumes, in declaration order."""
     entry = cc_info.get(bin_name)
     if not isinstance(entry, dict):
@@ -627,7 +649,7 @@ def _binary_deps(cc_info: dict, bin_name: str,
     out = []
     for n in names:
         if n not in deps:
-            raise Exception(
+            raise PipelineError(
                 f"Binary '{bin_name}' lists dependency '{n}', which is not "
                 f"declared under cc.yaml's `dependencies:` key.")
         out.append(deps[n])
@@ -655,6 +677,19 @@ def _find_executable(path: Path) -> Path | None:
     return next((p for p in order if p.is_file()), None)
 
 
+def _install_cc(cc_name: str, install: Path, flags: list[str]) -> Path:
+    """The armcc inside an install root; appends its include/ to `flags`."""
+    cc = _find_executable(install / 'bin' / 'armcc')
+    if cc is None:
+        raise PipelineError(
+            f"Compiler '{cc_name}': no armcc executable found under "
+            f"{install.resolve() / 'bin'}")
+    include = install / 'include'
+    if include.is_dir():
+        flags.append(f'-I{include.as_posix()}')
+    return cc
+
+
 def _scan_workers() -> int:
     """Parallelism for the symbol-discovery compiles."""
     return min(32, (os.cpu_count() or 4) * 2)
@@ -662,6 +697,7 @@ def _scan_workers() -> int:
 
 def _check_dirs(working_dir: Path, orig_dir: Path, tool_dir: Path,
                 sym_dir: Path, cc_path: Path):
+    """Fail with one message listing every required input that is missing."""
     missing = []
     if not orig_dir.exists():
         missing.append('directory "orig"')
@@ -679,10 +715,12 @@ def _check_dirs(working_dir: Path, orig_dir: Path, tool_dir: Path,
     if missing:
         msg = f"Pipeline incomplete for {working_dir}!"
         msg += "".join(f"\n  Missing {m}" for m in missing)
-        raise Exception(msg)
+        raise PipelineError(msg)
 
 
-def _gather_binaries(path: Path, module: str = None) -> tuple[ExHeader | None, dict[str, CTRBinary]]:
+def _gather_binaries(path: Path, module: str | None = None
+                     ) -> tuple[ExHeader | None, dict[str, CTRBinary]]:
+    """Load the exheader, code.bin and every CRO found under orig/."""
     binaries = {}
     exh = None
     code_path = None
@@ -705,22 +743,23 @@ def _gather_binaries(path: Path, module: str = None) -> tuple[ExHeader | None, d
 
 
 def _gather_symbols(sym_path: Path) -> list[Symbol]:
+    """Parse a symbol CSV, skipping rows that do not parse."""
     symbols = []
     reader = csv.DictReader(sym_path.read_text().splitlines())
     for line in reader:
-        try:
+        with contextlib.suppress(ValueError, KeyError):
             symbols.append(Symbol(
                 int(line["Location"], 16), line["Name"],
                 line["Mode"], int(line["Size"], 16), line["Segment"],
                 # Optional: older CSV exports have no Namespace column.
                 (line.get("Namespace") or '').strip()
             ))
-        except (ValueError, KeyError):
-            pass
     return symbols
 
 
-def _gather_sources(src_path: Path, cc_info: dict, module: str = None) -> dict[str, list[Path]]:
+def _gather_sources(src_path: Path, cc_info: dict,
+                    module: str | None = None) -> dict[str, list[Path]]:
+    """Every compilable, non-ignored file under src/<binary>/, per binary."""
     if not src_path.exists():
         return {}
     objects = {}
@@ -733,7 +772,7 @@ def _gather_sources(src_path: Path, cc_info: dict, module: str = None) -> dict[s
             for pat in d_info.get('ignored', []):
                 ignored.update(sub_dir.rglob(pat))
         if (sub_dir / DEP_PREFIX).exists():
-            raise Exception(
+            raise PipelineError(
                 f"{sub_dir.as_posix()}/{DEP_PREFIX} is reserved: referenced "
                 f"dependency sources are keyed under '{DEP_PREFIX}/'. Rename it.")
 
@@ -745,8 +784,8 @@ def _gather_sources(src_path: Path, cc_info: dict, module: str = None) -> dict[s
 
 
 def _add_dep_sources(sources: dict[str, list[Path]], cc_info: dict,
-                         deps: dict[str, "Dependency"], binaries: dict,
-                         module: str = None):
+                     deps: dict[str, Dependency], binaries: dict,
+                     module: str | None = None):
     """Add each binary's declared dependencies to its source list, in place.
 
     A dependency serving several binaries is compiled once per binary, as each
@@ -769,7 +808,7 @@ _ENTRY_KEYWORDS = {'ignored', 'dependencies'}
 
 
 def _resolve_cc_info(cc_info: dict, src_dir: Path,
-                     deps: dict[str, "Dependency"] | None = None) -> dict:
+                     deps: dict[str, Dependency] | None = None) -> dict:
     """Resolve preset definitions and wildcard patterns in cc.yaml.
 
     Dependency entries are expanded by the same code as binary entries, so a
@@ -835,11 +874,10 @@ def _expand_entry(name: str, entry: dict, preset_defs: dict, files_fn):
         is_glob = any(c in pattern for c in '*?[')
         if is_glob:
             for match in src_files:
-                if fnmatch.fnmatch(match, pattern) and match not in ignored:
-                    # Keyed on the path relative to the entry's root, so two
-                    # same-named files in different folders stay distinct.
-                    if match not in entry:
-                        entry[match] = config
-        else:
-            if pattern not in entry and pattern not in ignored:
-                entry[pattern] = config
+                # Keyed on the path relative to the entry's root, so two
+                # same-named files in different folders stay distinct.
+                if (fnmatch.fnmatch(match, pattern) and match not in ignored
+                        and match not in entry):
+                    entry[match] = config
+        elif pattern not in entry and pattern not in ignored:
+            entry[pattern] = config

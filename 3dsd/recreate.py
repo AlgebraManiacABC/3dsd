@@ -1,9 +1,11 @@
+"""Rebuilding a CRO module around relinked code."""
+
 import subprocess
 import tempfile
 from pathlib import Path
 
-from .ctrtype import CRO, BinaryWriter
-from .util import BinaryReader
+from .ctrtype import CRO
+from .util import BinaryReader, BinaryWriter
 
 
 def recreate_cro(linked_bin: Path, original_cro: Path, output: Path):
@@ -26,7 +28,7 @@ def cro_from_elf(linked_elf: Path, original_cro: Path, output: Path, objcopy: Pa
     with tempfile.TemporaryDirectory() as td:
         raw = Path(td) / 'linked.bin'
         result = subprocess.run(
-            [str(objcopy), str(linked_elf), '-O', 'binary', str(raw)])
+            [str(objcopy), str(linked_elf), '-O', 'binary', str(raw)], check=False)
         if result.returncode != 0:
             raise RuntimeError(
                 f"objcopy failed on {linked_elf} (exit {result.returncode})")

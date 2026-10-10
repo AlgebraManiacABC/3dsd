@@ -1,40 +1,44 @@
+"""Command-line entry point: python -m 3dsd <command> ...
+
+Each command imports only what it uses. Ninja starts a fresh process for every
+compile step -- thousands of them on a large project -- so keeping yaml and the
+project loader out of that path is worth the function-level imports.
+"""
+# pylint: disable=import-outside-toplevel
+
 import argparse
 import sys
 from pathlib import Path
 
+from .util import PipelineError
 
-def main():
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='3dsd',
         description='CTR (3DS) decompilation pipeline with Ninja integration',
     )
     sub = parser.add_subparsers(dest='command', required=True)
 
-    # --- split ---
-    p_split = sub.add_parser('split', help='Split original binaries into per-symbol ELF objects')
-    p_split.add_argument('dir', help='Project working directory')
-    p_split.add_argument('--single-binary', metavar='NAME',
-                         help='Operate on only this binary')
+    def project_command(name: str, help_text: str, single_binary: bool = True):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument('dir', help='Project working directory')
+        if single_binary:
+            p.add_argument('--single-binary', metavar='NAME',
+                           help='Operate on only this binary')
+        return p
+
+    p_split = project_command('split', 'Split original binaries into per-symbol ELF objects')
     p_split.add_argument('--no-progress', action='store_true')
 
-    # --- ninja ---
-    p_ninja = sub.add_parser('ninja', help='Generate build.ninja')
-    p_ninja.add_argument('dir', help='Project working directory')
-    p_ninja.add_argument('--single-binary', metavar='NAME',
-                         help='Operate on only this binary')
+    p_ninja = project_command('ninja', 'Generate build.ninja')
     p_ninja.add_argument('--roundtrip', action='store_true',
-                         help='Also emit the byte-perfect rebuild (split, '
-                              'compare, link, verify)')
+                         help='Also emit the byte-perfect rebuild (relink the '
+                              'split and verify it)')
 
-    # --- objdiff ---
-    p_objdiff = sub.add_parser('objdiff', help='Generate objdiff.json')
-    p_objdiff.add_argument('dir', help='Project working directory')
-    p_objdiff.add_argument('--single-binary', metavar='NAME',
-                           help='Operate on only this binary')
+    project_command('objdiff', 'Generate objdiff.json')
 
-    # --- build ---
-    p_build = sub.add_parser('build', help='Run ninja build')
-    p_build.add_argument('dir', help='Project working directory')
+    p_build = project_command('build', 'Run ninja build', single_binary=False)
     p_build.add_argument('-j', '--jobs', type=int, default=None,
                          help='Number of parallel jobs')
     p_build.add_argument('-k', '--keep-going', action='store_true',
@@ -47,54 +51,29 @@ def main():
     p_build.add_argument('targets', nargs='*', default=None,
                          help='Ninja targets (e.g. "compile")')
 
-    # --- check ---
-    p_check = sub.add_parser('check', help='Verify recreated binaries against originals')
-    p_check.add_argument('dir', help='Project working directory')
-    p_check.add_argument('--single-binary', metavar='NAME',
-                         help='Operate on only this binary')
+    project_command('check', 'Verify recreated binaries against originals')
 
-    # --- clean ---
-    p_clean = sub.add_parser('clean', help='Remove generated build output')
-    p_clean.add_argument('dir', help='Project working directory')
+    p_clean = project_command('clean', 'Remove generated build output', single_binary=False)
     p_clean.add_argument('targets', nargs='*',
                          help='build, split, link, out, ninja, objdiff, all '
                               '(default: everything except split)')
     p_clean.add_argument('-n', '--dry-run', action='store_true',
                          help='List what would be removed without deleting')
 
-    # --- progress ---
-    p_prog = sub.add_parser('progress', help='Report matching/in-progress function stats')
-    p_prog.add_argument('dir', help='Project working directory')
-    p_prog.add_argument('--single-binary', metavar='NAME',
-                        help='Operate on only this binary')
+    project_command('progress', 'Report matching/in-progress function stats')
 
-    # --- compile (internal, called by Ninja) ---
+    # --- internal commands, run by the rules in build.ninja ---
     p_compile = sub.add_parser('compile', help='Compile source file (internal)')
     p_compile.add_argument('--source', required=True)
     p_compile.add_argument('--output', required=True)
     p_compile.add_argument('--cc', required=True, dest='cc_path')
     p_compile.add_argument('--flags', default='')
 
-    # --- extract-compare (internal, called by Ninja) ---
-    p_ec = sub.add_parser('extract-compare', help='Extract symbol and compare (internal)')
-    p_ec.add_argument('--compiled', required=True)
-    p_ec.add_argument('--split', required=True)
-    p_ec.add_argument('--output', required=True)
-    p_ec.add_argument('--sym', required=True)
-    p_ec.add_argument('--symbols')
-    p_ec.add_argument('--base-addr', type=lambda x: int(x, 0), default=0)
-    p_ec.add_argument('--split-addr', type=lambda x: int(x, 0), default=0)
-    p_ec.add_argument('--compare-split',
-                      help='Alternate reference object to compare against; the '
-                           'object written for linking still comes from --split')
-
-    # --- link-base (internal, called by Ninja) ---
     p_lb = sub.add_parser('link-base', help='Link the objdiff base ELF (internal)')
     p_lb.add_argument('--ld', required=True)
     p_lb.add_argument('--output', required=True)
     p_lb.add_argument('--rsp', required=True)
 
-    # --- cro-from-elf (internal, called by Ninja) ---
     p_cro = sub.add_parser('cro-from-elf',
                            help='Flatten a linked ELF into a CRO module (internal)')
     p_cro.add_argument('--linked', required=True)
@@ -102,92 +81,77 @@ def main():
     p_cro.add_argument('--output', required=True)
     p_cro.add_argument('--objcopy', required=True)
 
-    # --- check-file (internal, called by Ninja) ---
     p_chkfile = sub.add_parser('check-file', help='Verify a single binary (internal)')
     p_chkfile.add_argument('--original', required=True)
     p_chkfile.add_argument('--built', required=True)
+    p_chkfile.add_argument('--stamp', required=True,
+                           help='Written on a match, removed on a mismatch')
 
-    args = parser.parse_args()
+    return parser
 
+
+def _load(args: argparse.Namespace):
+    from .config import ProjectConfig
+    return ProjectConfig.load(Path(args.dir), args.single_binary)
+
+
+def _run(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements
+    """Dispatch one parsed command; returns the process exit code."""
     match args.command:
         case 'split':
-            from .config import ProjectConfig
             from .split import run_split
-            config = ProjectConfig.load(Path(args.dir), args.single_binary)
-            run_split(config, not args.no_progress)
-
+            run_split(_load(args), not args.no_progress)
         case 'ninja':
-            from .config import ProjectConfig
             from .ninja import generate_ninja
-            config = ProjectConfig.load(Path(args.dir), args.single_binary)
-            generate_ninja(config, args.roundtrip)
-
+            generate_ninja(_load(args), args.roundtrip)
         case 'objdiff':
-            from .config import ProjectConfig
             from .objdiff import generate_objdiff
-            config = ProjectConfig.load(Path(args.dir), args.single_binary)
-            generate_objdiff(config)
-
+            generate_objdiff(_load(args))
         case 'build':
             from .build import run_build
             ok = run_build(Path(args.dir), args.jobs, args.keep_going,
                            args.targets, args.roundtrip)
-            sys.exit(0 if ok else 1)
-
+            return 0 if ok else 1
         case 'check':
-            from .config import ProjectConfig
             from .check import run_check
-            config = ProjectConfig.load(Path(args.dir), args.single_binary)
-            ok = run_check(config)
-            sys.exit(0 if ok else 1)
-
+            return 0 if run_check(_load(args)) else 1
         case 'clean':
             from .clean import run_clean
-            ok = run_clean(Path(args.dir), args.targets, args.dry_run)
-            sys.exit(0 if ok else 1)
-
+            return 0 if run_clean(Path(args.dir), args.targets, args.dry_run) else 1
         case 'progress':
-            from .config import ProjectConfig
             from .objdiff import report_progress
-            config = ProjectConfig.load(Path(args.dir), args.single_binary)
-            report_progress(config)
-
+            report_progress(_load(args))
         case 'compile':
-            from .compare import compile_source
-            flags = args.flags.split(',') if args.flags else []
+            from .compiler import compile_source
             compile_source(
                 source=Path(args.source),
                 output=Path(args.output),
                 cc=Path(args.cc_path),
-                flags=flags,
+                flags=args.flags.split(',') if args.flags else [],
             )
-
-        case 'extract-compare':
-            from .compare import extract_and_compare
-            extract_and_compare(
-                compiled=Path(args.compiled),
-                split=Path(args.split),
-                output=Path(args.output),
-                sym=args.sym,
-                symbols_csv=Path(args.symbols) if args.symbols else None,
-                base_addr=args.base_addr,
-                split_addr=args.split_addr,
-                compare_split=Path(args.compare_split) if args.compare_split else None,
-            )
-
         case 'link-base':
             from .objdiff import link_base
-            sys.exit(link_base(Path(args.ld), Path(args.output), Path(args.rsp)))
-
+            return link_base(Path(args.ld), Path(args.output), Path(args.rsp))
         case 'cro-from-elf':
             from .recreate import cro_from_elf
             cro_from_elf(Path(args.linked), Path(args.original),
                          Path(args.output), Path(args.objcopy))
-
         case 'check-file':
-            from .check import check_binary
-            ok = check_binary(Path(args.original), Path(args.built))
-            sys.exit(0 if ok else 1)
+            from .check import verify_file
+            ok = verify_file(Path(args.original), Path(args.built), Path(args.stamp))
+            return 0 if ok else 1
+    return 0
+
+
+def main():
+    """Parse the command line and run it, exiting with its status."""
+    args = _build_parser().parse_args()
+    try:
+        status = _run(args)
+    except PipelineError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        status = 1
+    sys.exit(status)
 
 
 if __name__ == '__main__':

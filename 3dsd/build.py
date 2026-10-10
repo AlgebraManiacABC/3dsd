@@ -1,12 +1,19 @@
+"""`3dsd build`: split (optionally), generate build.ninja, run ninja, report."""
+
 import shutil
 import subprocess
-import sys
 from pathlib import Path
+
+from .config import ProjectConfig
+from .ninja import generate_ninja
+from .objdiff import generate_objdiff, report_progress
+from .split import run_split
 
 
 def _find_ninja() -> str | None:
+    """The pip-installed ninja if present, else whatever is on PATH."""
     try:
-        from ninja import BIN_DIR
+        from ninja import BIN_DIR  # pylint: disable=import-outside-toplevel  # optional
         return str(Path(BIN_DIR) / 'ninja')
     except ImportError:
         pass
@@ -15,11 +22,7 @@ def _find_ninja() -> str | None:
 
 def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
               targets: list[str] | None, roundtrip: bool = False) -> bool:
-    from .config import ProjectConfig
-    from .split import run_split
-    from .ninja import generate_ninja
-    from .objdiff import generate_objdiff, report_progress
-
+    """Run the whole pipeline once; True if ninja succeeded."""
     config = ProjectConfig.load(working_dir)
 
     # The split exists only to feed the round-trip: the objdiff target is cut
@@ -33,7 +36,8 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
 
     ninja_bin = _find_ninja()
     if not ninja_bin:
-        _print("Error: ninja not found. Install it via pip (pip install ninja) or your system package manager.")
+        _print("Error: ninja not found. Install it via pip (pip install ninja) "
+               "or your system package manager.")
         return False
 
     _print("=== Build ===")
@@ -45,7 +49,7 @@ def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
     if targets:
         cmd += targets
 
-    result = subprocess.run(cmd)
+    result = subprocess.run(cmd, check=False)
 
     _print("=== Objdiff ===")
     generate_objdiff(config)

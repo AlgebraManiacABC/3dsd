@@ -1,3 +1,6 @@
+"""objdiff integration: target ELFs, objdiff.json, the base link and progress."""
+
+import ctypes
 import json
 import os
 import shutil
@@ -7,8 +10,11 @@ import sys
 from pathlib import Path
 
 from .config import ProjectConfig
-from .elf import write_target_elf
-from .util import Symbol, sanitize
+from .elf import SectionHeaderType, write_target_elf
+from .util import Symbol, posix, sanitize
+
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_STD_OUTPUT_HANDLE = -11
 
 
 def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
@@ -37,7 +43,7 @@ def _complete_symbols(symbols: list[Symbol], bin_size: int) -> list[Symbol]:
             result.append(Symbol(cur, f'pad_{cur:08x}', '$a', bin_size - cur,
                                  last_segment, gap_namespace(idx)))
             break
-        elif cur == addrs[idx]:
+        if cur == addrs[idx]:
             sym = sym_dict[cur]
             next_addr = addrs[idx + 1] if idx + 1 < len(addrs) else bin_size
             size = min(sym.size, next_addr - cur)
@@ -123,8 +129,8 @@ def generate_target_elfs(config: ProjectConfig):
     """Wrap each original binary as an ELF with symbols from the CSV."""
     target_dir = config.out_dir / 'objdiff_target'
     target_dir.mkdir(parents=True, exist_ok=True)
-    for name in config.binaries:
-        data = config.binaries[name].data
+    for name, binary in config.binaries.items():
+        data = binary.data
         decompiled = config.get_decompiled_data(name)
         raw = _route_data(config.symbols.get(name, []), decompiled)
         syms = _skip_data_padding(_complete_symbols(raw, len(data)))
@@ -150,8 +156,8 @@ def generate_objdiff(config: ProjectConfig):
                   f"'ninja objdiff' and check the LINK_BASE output.")
         unit = {
             "name": name,
-            "target_path": _posix(target_path),
-            "base_path": _posix(_rel(base_elf, config.working_dir)) if base_elf.exists() else None,
+            "target_path": posix(target_path),
+            "base_path": posix(_rel(base_elf, config.working_dir)) if base_elf.exists() else None,
             "metadata": {
                 "progress_categories": [name],
             },
@@ -323,18 +329,15 @@ def supports_color(stream=None) -> bool:
     if os.name == 'nt':
         # Legacy consoles print escapes literally unless VT mode is enabled.
         try:
-            import ctypes
             kernel32 = ctypes.windll.kernel32
-            handle = kernel32.GetStdHandle(-11)
+            handle = kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
             mode = ctypes.c_ulong()
             if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 return False
-            ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-            if not mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
-                if not kernel32.SetConsoleMode(
-                        handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING):
-                    return False
-        except Exception:
+            vt_mode = mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            if vt_mode != mode.value and not kernel32.SetConsoleMode(handle, vt_mode):
+                return False
+        except (AttributeError, OSError):
             return False
     return True
 
@@ -407,8 +410,11 @@ def report_progress(config: ProjectConfig):
         print("  objdiff-cli not found — install it for progress reporting.")
         return
 
-    result = subprocess.run([cli, 'report', 'generate'],
-                            cwd=config.working_dir, capture_output=True, text=True)
+    # Pretty-printed so the saved report.json is readable and diffs line by
+    # line; json.loads below does not care either way.
+    result = subprocess.run([cli, 'report', 'generate', '--format', 'json-pretty'],
+                            cwd=config.working_dir, capture_output=True, text=True,
+                            check=False)
     if result.returncode != 0:
         stderr = result.stderr.strip()
         msg = stderr.splitlines()[-1] if stderr else 'unknown error'
@@ -448,10 +454,6 @@ def _rel(path: Path, base: Path) -> Path:
         return path
 
 
-def _posix(p) -> str:
-    return str(p).replace('\\', '/')
-
-
 def link_base(ld: Path, output: Path, rsp: Path) -> int:
     """Link the compiled objects into the relocatable base ELF for objdiff.
 
@@ -471,10 +473,11 @@ def link_base(ld: Path, output: Path, rsp: Path) -> int:
     args = ['-r', '--no-warn-mismatch', '-T', str(script), f'@{rsp}',
             '-o', str(output)]
 
-    result = subprocess.run([str(ld), '--force-group-allocation'] + args,
-                            capture_output=True, text=True)
+    result = subprocess.run([str(ld), '--force-group-allocation', *args],
+                            capture_output=True, text=True, check=False)
     if result.returncode != 0 and 'force-group-allocation' in result.stderr:
-        result = subprocess.run([str(ld)] + args, capture_output=True, text=True)
+        result = subprocess.run([str(ld), *args], capture_output=True, text=True,
+                                check=False)
     if result.returncode != 0:
         sys.stderr.write(result.stderr)
         # Ninja leaves a failed command's output in place; a half-written base
@@ -504,7 +507,7 @@ def strip_none_relocs(path: Path) -> int:
     removed = 0
     for i in range(shnum):
         head = shoff + shentsize * i
-        if struct.unpack_from('<I', data, head + 4)[0] != 9:  # SHT_REL
+        if struct.unpack_from('<I', data, head + 4)[0] != SectionHeaderType.SHT_REL:
             continue
         off, size = struct.unpack_from('<II', data, head + 0x10)
         entsize = struct.unpack_from('<I', data, head + 0x24)[0] or 8

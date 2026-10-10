@@ -1,11 +1,12 @@
 # 3dsd — 3DS Decompilation Pipeline
 
 A build pipeline for matching decompilations of 3DS binaries (`code.bin` and
-`.cro` modules). It splits the original binary into per-function objects,
-compiles your decompiled sources with the original ARM compiler, compares the
-results byte-for-byte (relocation-aware), and reports progress. The rebuilt
-binary is **always byte-perfect** — unmatched or in-progress code falls back to
-the original bytes automatically.
+`.cro` modules). It compiles your decompiled sources with the original ARM
+compiler, finds every function and data object they define, and measures them
+against the original binary with [objdiff](https://github.com/encounter/objdiff)
+to report progress. With `--roundtrip` it also splits the original into
+per-symbol objects and relinks them, checking that the pipeline reproduces the
+binary byte for byte.
 
 ALL work done in Claude Code using Opus 4.6 and Fable 5 models.
 
@@ -17,9 +18,9 @@ ALL work done in Claude Code using Opus 4.6 and Fable 5 models.
 - GNU `ld` and `objcopy` for ARM in the project's `tools/` directory
   (binutils 2.36+ preferred: `ld --force-group-allocation` tidies up the
   objdiff base ELF, and is skipped when unsupported)
-- Optional: [objdiff](https://github.com/encounter/objdiff) for a per-function
-  diff GUI; if `objdiff-cli` is on PATH or in the project's `tools/` directory,
-  its report is included in progress output
+- `objdiff-cli`, on PATH or in the project's `tools/` directory, for the
+  progress figures. Everything else runs without it. The objdiff GUI is
+  optional, for per-function diffs.
 
 ## Project layout
 
@@ -38,10 +39,10 @@ myproject/
 Everything else is generated and safe to delete (see `clean` below):
 
 ```
-├── build/          compiled translation units, mirroring src/ (Item/Item.c.o)
-├── split/          per-symbol .o carved out of the original binary
-├── link/           compared objects, plus <bin>_linked and its .map
-├── out/            recreated binaries, plus objdiff_base/ and objdiff_target/
+├── build/          compiled translation units, mirroring src/ (code.bin/Item/Item.c.o)
+├── split/          per-symbol .o carved out of the original binary (--roundtrip)
+├── link/           <bin>_linked and its .map (--roundtrip)
+├── out/            objdiff_base/, objdiff_target/, report.json, recreated binaries
 ├── build.ninja     generated build graph
 └── objdiff.json    generated objdiff project
 ```
@@ -50,11 +51,19 @@ A top-level `include/` directory, if present, is added as `-Iinclude` to every
 source in the project, ahead of any dependency or toolchain headers. Reconstructed
 types belong there and are reachable as `#include "types.h"` from any depth,
 rather than each file counting directories back to them. Nothing breaks if you
-already list it in `flags:` -- it is not added twice -- and a project without the
+already list it in `flags:` — it is not added twice — and a project without the
 directory is unaffected.
 
 Symbol CSVs have the header `Location,Name,Mode,Size,Segment`, e.g.
 `00100000,Entry,$a,00000002,".text"` (`$a` = ARM, `$t` = Thumb; hex sizes).
+
+Put the title's `exheader.bin` in `orig/` too. It records where `code.bin`'s
+`.text`, `.rodata` and `.data` really begin and end, and when it is present
+each symbol's segment is taken from its address rather than the `Segment`
+column, with a warning listing any labels that disagree. That matters for
+`--roundtrip`: the linker gathers all `.rodata` before all `.data`, so one
+mislabelled object is moved out of address order and the verify fails.
+Progress does not depend on the labels.
 
 An optional `Namespace` column may follow `Name`
 (`Location,Name,Namespace,Mode,Size,Segment`). Anything whose namespace is
@@ -136,21 +145,21 @@ code.bin:
     flags: [--cpu=MPCore, -O3, --split_sections, -Iinclude]
 ```
 
-Use `--split_sections` in your flags for any file holding more than one
-function — it is what lets the pipeline see the individual functions. Without
-it armcc emits a single `.text`, and the file can only stand for the one symbol
-it is named after.
+`--split_sections` is optional. Symbols are discovered from each object's
+symbol table, which names every function and data object whether they share
+one `.text` or sit in `i.NAME` sections of their own, so progress is measured
+the same either way. Use it or not to match how the game was built.
 
 ## Referencing external dependencies
 
-3DS games share libraries -- `nw4c`, `nnsdk`, zlib, libpng -- and some of them
+3DS games share libraries — `nw4c`, `nnsdk`, zlib, libpng — and some of them
 are decompilation projects in their own right. Rather than copying that code
 into `src/`, point at it: put it under `deps/<name>` (a git submodule is the
 natural way, and pins a revision for free) and describe it in `cc.yaml`.
 
 Nothing is assumed about the dependency's own layout. It is treated as an
 inert directory of files, and *everything* about how to build it is declared by
-your project -- which is what lets an arbitrary upstream repo be used
+your project — which is what lets an arbitrary upstream repo be used
 unmodified.
 
 ```yaml
@@ -166,8 +175,8 @@ code.bin:
   dependencies: [libpng]  # binaries declare what they consume
 ```
 
-A dependency entry accepts everything a binary entry does -- `ignored:`,
-`presets:`, wildcards and per-file `{cc, flags}` overrides -- and falls back to
+A dependency entry accepts everything a binary entry does — `ignored:`,
+`presets:`, wildcards and per-file `{cc, flags}` overrides — and falls back to
 `default:` like anything else. The only difference is that its paths are
 relative to the dependency root instead of `src/<binary>/`.
 
@@ -176,8 +185,8 @@ relative to the dependency root instead of `src/<binary>/`.
 - `include:` directories are added as `-I` to **every** source compiled for a
   binary that declares the dependency, so your own code can include its
   headers, and one dependency can include another's.
-- Dependency files are compiled as ordinary translation units and compared
-  per-function, exactly like your own sources, and count toward the binary's
+- Dependency files are compiled as ordinary translation units and measured
+  per symbol, exactly like your own sources, and count toward the binary's
   progress. A dependency serving several binaries is compiled once per binary.
 - Your own sources always win: if a file under `src/` and a dependency file
   define the same symbol, `src/` claims it and the overlap is reported.
@@ -190,8 +199,8 @@ relative to the dependency root instead of `src/<binary>/`.
   ```
 
 A headers-only entry is also the way to give a bare `tools/` compiler its
-standard headers. armcc does not locate its own `include` directory -- the
-`-I` is what makes `<string.h>` resolve -- and the pipeline can only add it
+standard headers. armcc does not locate its own `include` directory — the
+`-I` is what makes `<string.h>` resolve — and the pipeline can only add it
 automatically when cc.yaml names an install root under `compilers:`, or when
 `tools/<name>` is a directory. When the compiler is a lone executable in
 `tools/`, point a dependency at its headers instead:
@@ -212,8 +221,8 @@ calls those addresses `FUN_0034a1c0`, a perfectly decompiled library will claim
 nothing. That summary line is how you find out.
 
 Not everything under `deps/` belongs in your repository. A decompiled library
-is normally a submodule, but a vendored toolchain -- a compiler and its
-standard headers -- is licensed material that must not be committed. Ignore
+is normally a submodule, but a vendored toolchain — a compiler and its
+standard headers — is licensed material that must not be committed. Ignore
 those, keeping the directory itself:
 
 ```gitignore
@@ -228,7 +237,7 @@ than compiling on and failing later with `cannot open source input file
 "stdio.h"`.
 
 The pipeline never runs git commands that write. If `deps/<name>` is missing or
-empty -- the usual uninitialised-submodule case -- it says so and names the fix.
+empty — the usual uninitialised-submodule case — it says so and names the fix.
 
 ### cc.yaml reference
 
@@ -263,12 +272,13 @@ progress never needs the originals taken apart.
 python -m 3dsd build . --roundtrip
 ```
 
-adds the byte-perfect rebuild -- split every symbol, compare each decompiled
-function against its original bytes, link them all back together, and verify
-the result hashes identically to `orig/`. Every object that link consumes holds
-original bytes, so it confirms the pipeline agrees with itself rather than
-measuring the decomp; progress is the same either way. It is off by default
-because it costs a split and a link of every symbol in every binary -- for
+adds the byte-perfect rebuild — split every symbol, link the pieces back
+together, and verify the result hashes identically to `orig/`. A mismatch
+fails the build. Every object that link consumes holds original bytes, so it
+confirms the pipeline agrees with itself (the split, the linker script, the
+CRO rebuild) rather than measuring the decomp; progress is the same either
+way. It is off by default
+because it costs a split and a link of every symbol in every binary — for
 ACNL's `code.bin` that is 74,384 objects and a link measured in minutes, versus
 seconds for the progress path. Run it when the split, the linker script or the
 CRO rebuild changed, and in CI. Other commands:
@@ -303,36 +313,31 @@ Because `clean` removes `build.ninja`, run `python -m 3dsd ninja .` (or any
 
 Source layout is free. Put one function in a file named after it, put a whole
 translation unit's worth in one file, use C or C++ — the pipeline compiles each
-file once, reads the `i.NAME` sections `--split_sections` produced, and
-compares every function it finds against the original independently.
+file once, reads the symbol table of the object, and claims every function and
+data object it finds that the symbol CSV also names.
 
 - **One function per file**: name the file after the symbol
-  (`FUN_00123456.c`, `_Z9ActNpCharP6NpChar.cpp`). No `--split_sections` needed.
-- **C++ templates**: instantiations land in `t.NAME` sections rather than
-  `i.NAME`, and are discovered the same way -- a C++ file is usually mostly
-  these.
+  (`FUN_00123456.c`, `_Z9ActNpCharP6NpChar.cpp`).
 - **Many functions per file**: any filename works, including a name that
   happens to be one of the functions inside (`inflate.c` holding `inflate`,
-  `inflateEnd` and `inflateReset`). Needs `--split_sections`.
+  `inflateEnd` and `inflateReset`).
 - **C++**: symbols are matched under their mangled names, which is what the
   symbol CSV holds, so nothing is needed beyond the right compiler flags.
+  Template instantiations are found like any other function.
+- **Data**: a global the CSV names is claimed and measured like a function,
+  in whichever of `.rodata` or `.data` the compiler put it.
 - Files are identified by their path under `src/<binary>/`, so `zlib/util.c`
   and `png/util.c` are distinct, as are `foo.c` and `foo.cpp`.
 - If two files define the same symbol, the file *named* after it wins; failing
-  that, the first in path order does, and the overlap is reported. Two files
-  defining the same **global** symbol will still break the objdiff base link —
-  that is a genuine conflict in the sources, not something to paper over.
-- A function's **literal pool** is compared with it. armcc keeps the pool at the
-  end of the function's own section, while a symbol's size covers only its
-  instructions -- so the compiled form is often a few bytes longer. Rather than
-  asking you to overstate the size in Ghidra (the pool is data, not code), the
-  comparison widens to cover the trailing padding and pool, but never past the
-  next symbol. Widening only ever makes a comparison stricter, so it cannot
-  invent a match, and the linked output is untouched.
-- A function counts as *matching* only if its bytes equal the original exactly,
-  with relocation sites verified against the symbol CSV where the target
-  address is known (and masked out where it isn't — data globals, library
-  calls, unnamed functions).
+  that, the first in path order does, and the overlap is reported. Vtables,
+  RTTI records and template instantiations that every translation unit emits
+  are folded silently, as the linker would. Two files with the same **strong**
+  definition will still break the objdiff base link — that is a genuine
+  conflict in the sources, not something to paper over.
+- Keep a function's CSV size to its instructions. armcc places the literal
+  pool after them inside the function's own section, so the compiled symbol is
+  often a few bytes longer; objdiff diffs over the target symbol's extent and
+  still scores such a function 100%.
 
 `3dsd ninja` compiles every source once to do this discovery (in parallel,
 cached in `build/`); on an 1,800-file project that is around 20 seconds cold
@@ -346,49 +351,67 @@ the objdiff base ELF is assembled and why it needs its own linker script.
 One row per binary, plus a `Total` row when there is more than one:
 
 ```
-  Binary        |          Code bytes |  Code % | Fuzzy % | Functions 100% | Func % | Data bytes |         Total bytes | Total %
-  --------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
-  ModuleFtr.cro |      0 /    179,968 | 0.0000% | 0.0000% |     0 /    236 |  0.00% |          - |      0 /    179,968 | 0.0000%
-  code.bin      | 30,358 /  7,574,364 | 0.4008% | 0.4754% | 1,569 / 53,330 |  2.94% |  1,350,820 | 30,358 /  8,925,184 | 0.3401%
-  --------------+---------------------+---------+---------+----------------+--------+------------+---------------------+--------
-  Total         | 30,358 / 12,047,532 | 0.2520% | 0.2989% | 1,569 / 55,921 |  2.81% |  1,350,820 | 30,358 / 13,398,352 | 0.2266%
+  Binary   |       Code bytes |  Code % | Fuzzy Code % |      Data bytes |  Data % | Fuzzy Data % | Total bytes | Total %
+  ---------+------------------+---------+--------------+-----------------+---------+--------------+-------------+--------
+  code.bin | 13,952 / 290,816 | 4.7975% |     13.1438% | 9,646 / 204,800 | 4.7100% |      4.7100% |     495,616 | 4.7613%
 ```
 
-The table is about 135 columns wide with long binary names. Numerators and
-denominators are sized independently, so the `/` separators line up down each
-column no matter how the magnitudes differ.
+Code and data are measured separately, each against its own size, because
+objdiff reports them that way:
 
-Values that move during a decomp — matched byte counts, matched function
-counts, and every percentage — are coloured on a red → yellow → green scale by
-how complete they are. Fixed denominators are left uncoloured. Exactly zero is
-dimmed to a darker red, so a binary nobody has started is distinguishable from
-one just underway; early in a decomp the gradient alone is far too shallow to
-separate them. Colour is emitted only when stdout is a terminal, and is
-disabled by setting `NO_COLOR`, so redirected or piped output stays plain.
+- **Code bytes / Code %** — bytes in functions that match exactly, out of
+  objdiff's `total_code`.
+- **Fuzzy Code %** — partial credit for functions still in progress, so it is
+  always ≥ *Code %*.
+- **Data bytes / Data %** — matched data out of `total_data`. objdiff credits
+  a data section only once it matches completely.
+- **Fuzzy Data %** — how far along the data is: the size-weighted mean of
+  objdiff's per-section fuzzy percentages, which objdiff does not total itself.
+- **Total bytes / Total %** — code and data together, the closest thing to
+  whole-binary completion.
 
-**Code %** is measured against the binary's **code**, not its total size — the
-denominator is objdiff's `total_code`, which excludes the bytes in the *Data
-bytes* column. For the `code.bin` row that is 7,574,364 of 8,925,184, so the
-same match reads as 0.4008% of code but 0.3401% of the file.
+Only data you have actually decompiled is paired and diffed. Everything else
+is routed to a section the base never has, because objdiff's data diff is
+quadratic in section length: pairing all of New Leaf's 1.13 MB `.rodata`
+would take over an hour.
 
-**Total bytes** spans code + data, and is the closest thing to whole-binary
-completion. Its numerator counts matched data only when objdiff reports one,
-so while data is untracked it equals the code numerator and the percentage is
-a *floor*.
+A `-` means an exact zero — a binary nobody has started, or a CRO with no data
+section of its own. A value that merely rounds to `0.0000%` keeps its digits,
+because it is real progress.
 
-**Fuzzy %** adds partial credit for in-progress functions (masked byte ratio),
-so it is always ≥ *Code %*. **Func %** counts only functions matching 100%,
-and is a fraction of the function *count* — not of bytes, so it moves at a
-different rate than *Code %*.
-
-The *data* line reports only the size when objdiff returns no `matched_data`
-figure, which is the normal case for whole-binary units: objdiff matches data
-at the section level, and a unit spanning the entire binary gives it nothing
-to compare. If objdiff does report matched data, the line shows the full
-`matched / total (percent)` form instead. Code matching is unaffected — it is
-symbol-based and works regardless.
+Values that move during a decomp are coloured on a red → yellow → green scale
+by how complete they are; fixed denominators are left uncoloured. Exact zeros
+are dimmed to a darker red, so an untouched binary stands out from one that is
+barely underway. Colour is emitted only when stdout is a terminal, and setting
+`NO_COLOR` turns it off, so redirected or piped output stays plain.
 
 Progress is computed by `objdiff-cli`, which is looked up on `PATH` and then in
 the project's `tools/` directory; without it the rest of the build still runs.
-Open the project in the objdiff GUI (`objdiff.json` is generated for you) for
-instruction-level diffs of any function.
+Its full report — per unit, per section and per symbol — is saved,
+pretty-printed, to `out/report.json`. Open the project in the objdiff GUI
+(`objdiff.json` is generated for you) for instruction-level diffs of any
+function.
+
+## Development
+
+The package has no test suite yet; changes are checked by building a real
+project before and after and comparing the outputs. Linting is configured in
+`pyproject.toml`:
+
+```bash
+pip install ruff pylint
+```
+
+```bash
+ruff check 3dsd
+```
+
+```bash
+pylint 3dsd
+```
+
+Both are expected to pass cleanly. Problems with a project's own inputs — a
+missing directory, a bad `cc.yaml` entry, a compiler that reports the wrong
+version — are raised as `PipelineError` and printed as a one-line error
+rather than a traceback.
+
