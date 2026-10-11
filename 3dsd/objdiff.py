@@ -11,8 +11,9 @@ from pathlib import Path
 
 from .config import ProjectConfig
 from .ctrtype import CRO, CTRBinary
+from .datasplit import split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
-from .reloc import RelocRecovery, read_base
+from .reloc import BaseObject, RelocRecovery, read_base
 from .util import Symbol, posix, sanitize
 
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
@@ -85,7 +86,8 @@ DATA_SEGMENTS = ('.rodata', '.data')
 SKIP_SEGMENT = '.undecompiled'
 
 
-def _route_data(symbols: list[Symbol], decompiled: dict[str, str]) -> list[Symbol]:
+def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
+                split: dict[str, str] | None = None) -> list[Symbol]:
     """Send each data symbol to the section that lets it pair, or out of the way.
 
     A decompiled object takes the section armcc put the base's copy in, not the
@@ -94,15 +96,22 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str]) -> list[Symbo
     export has no way to know. Following the CSV instead would leave the halves
     in different sections, pairing nothing while looking entirely healthy.
 
+    An object the base has given a section of its own (`split`, see
+    datasplit.py) goes to the section of the same name, so it pairs, and
+    scores, alone.
+
     Applied before the gaps are filled, so the padding between two undecompiled
     data objects inherits the skipped segment too and stays out of the diff.
     """
+    split = split or {}
     out = []
     for sym in symbols:
         if sym.segment not in DATA_SEGMENTS:
             out.append(sym)
             continue
         section = decompiled.get(sanitize(sym.name), SKIP_SEGMENT)
+        if section != SKIP_SEGMENT:
+            section = split.get(sym.name, section)
         out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
                           section, sym.namespace))
     return out
@@ -119,12 +128,17 @@ def _skip_data_padding(symbols: list[Symbol]) -> list[Symbol]:
     """
     out = []
     for sym in symbols:
-        if sym.segment in DATA_SEGMENTS and sym.name.startswith('pad_'):
+        if _is_data(sym.segment) and sym.name.startswith('pad_'):
             out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
                               SKIP_SEGMENT, sym.namespace))
         else:
             out.append(sym)
     return out
+
+
+def _is_data(segment: str) -> bool:
+    """Whether a segment pairs with base data: `.rodata`, `.data`, or one object's own."""
+    return segment in DATA_SEGMENTS or segment.partition(':')[0] in DATA_SEGMENTS
 
 
 def generate_target_elfs(config: ProjectConfig):
@@ -140,9 +154,12 @@ def generate_target_elfs(config: ProjectConfig):
         data = binary.data
         decompiled = config.get_decompiled_data(name)
         csv = config.symbols.get(name, [])
-        raw = _route_data(csv, decompiled)
+        base_path = config.out_dir / 'objdiff_base' / name
+        base = read_base(base_path.read_bytes()) if base_path.exists() else None
+        split = split_sections_of(base.names) if base is not None else {}
+        raw = _route_data(csv, decompiled, split)
         syms = _skip_data_padding(_complete_symbols(raw, len(data)))
-        data, relocs, mapping, rel_note = _recover_relocs(config, name, binary, csv, syms)
+        data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms)
         out = target_dir / name
         write_target_elf(out, data, syms, relocs, mapping)
         std_bytes = sum(s.size for s in syms if s.is_stdlib)
@@ -151,12 +168,10 @@ def generate_target_elfs(config: ProjectConfig):
         print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note}{rel_note} -> {out}")
 
 
-def _recover_relocs(config: ProjectConfig, name: str, binary: CTRBinary,
+def _recover_relocs(base: BaseObject | None, binary: CTRBinary,
                     csv: list[Symbol], syms: list[Symbol]):
     """`(data, relocs, mapping, note)`: the target's bytes, relocations and
     literal-pool mapping symbols, recovered against its base."""
-    base_path = config.out_dir / 'objdiff_base' / name
-    base = read_base(base_path.read_bytes()) if base_path.exists() else None
     if base is None:
         return binary.data, [], [], ''
     # A CRO's pointers are fixed up at load time, so its pool words hold no
@@ -485,7 +500,7 @@ def _rel(path: Path, base: Path) -> Path:
 def link_base(ld: Path, output: Path, rsp: Path) -> int:
     """Link the compiled objects into the relocatable base ELF for objdiff.
 
-    Two things have to happen that plain `ld -r` does not do:
+    Three things have to happen that plain `ld -r` does not do:
 
     * `base.ld` folds armcc's per-symbol `i.NAME` sections back into
       .text/.rodata/.data/.bss so objdiff can pair them with the target.
@@ -495,6 +510,9 @@ def link_base(ld: Path, output: Path, rsp: Path) -> int:
     * armcc emits R_ARM_NONE marker relocations (the printf-variant hints, for
       one). objdiff rejects relocation type 0 outright and refuses to read the
       whole file, so they are stripped afterwards.
+    * Every named data object is given a section of its own, so objdiff
+      credits each one that matches rather than all of `.rodata` or nothing
+      (datasplit.py).
     """
     script = Path(__file__).parent / 'base.ld'
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -516,6 +534,7 @@ def link_base(ld: Path, output: Path, rsp: Path) -> int:
     removed = strip_none_relocs(output)
     if removed:
         print(f"  {output.name}: stripped {removed} R_ARM_NONE relocation(s)")
+    split_data_objects(output)
     return 0
 
 
