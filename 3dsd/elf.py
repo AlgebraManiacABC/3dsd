@@ -1,5 +1,7 @@
 """Minimal ELF32 (ARM, little-endian) writing for relocatable objects."""
 
+import bisect
+from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 
@@ -230,34 +232,59 @@ def _segment_runs(sym_list: list[Symbol], size: int) -> list[tuple[str, int, int
     return runs
 
 
-def _target_symtab(sym_list: list[Symbol], runs: list[tuple[str, int, int]],
-                   merged: dict[str, list[tuple[int, int]]]):
-    """Build `(local_syms, global_syms, strtab)` for `write_target_elf`."""
-    sec_names = list(merged)
+@dataclass(frozen=True)
+class TargetReloc:
+    """A relocation to write into the objdiff target.
 
-    # Where each run lands inside its merged section, and which ELF section
-    # index that is (shndx 0 is the NULL entry).
-    run_offset = {}
-    for name, name_runs in merged.items():
-        off = 0
-        for start, end in name_runs:
-            run_offset[(name, start)] = off
-            off += end - start
-    run_shndx = [sec_names.index(name) + 1 for name, _start, _end in runs]
+    `addr` is the binary offset of the relocated bytes and `symbol` the name
+    of the symbol it refers to. The addend lives in the bytes at `addr` (REL),
+    as it does in the base.
+    """
+    addr: int
+    rtype: int
+    symbol: str
 
+
+_STB_GLOBAL_NOTYPE = 0x10
+_SHF_INFO_LINK = 0x40
+
+
+class _TargetLayout:
+    """Where each run of the binary lands: section index and offset within it."""
+
+    def __init__(self, runs: list[tuple[str, int, int]], sec_names: list[str]):
+        self.starts = []
+        self.places = []
+        offsets = dict.fromkeys(sec_names, 0)
+        for name, start, end in runs:
+            self.starts.append(start)
+            self.places.append((sec_names.index(name) + 1, offsets[name] - start))
+            offsets[name] += end - start
+
+    def place(self, addr: int) -> tuple[int, int]:
+        """`(shndx, section offset)` of a binary offset."""
+        shndx, delta = self.places[bisect.bisect_right(self.starts, addr) - 1]
+        return shndx, addr + delta
+
+
+def _target_symtab(sym_list: list[Symbol], layout: _TargetLayout,  # pylint: disable=too-many-locals
+                   sec_names: list[str], relocs: list[TargetReloc],
+                   mapping: list[tuple[int, str]]):
+    """Build `(local_syms, global_syms, strtab, symbol_index)` for `write_target_elf`.
+
+    `symbol_index` maps each name a relocation refers to to its index in the
+    symbol table. A name the target does not define (a std function, a .bss
+    object) becomes an undefined global, which objdiff pairs with the base by
+    name and addend alone.
+    """
     local_strtab = bytearray(b'\x00')
     global_strtab = bytearray()
     local_syms = []
     global_syms = []
-    run_idx = 0
+    global_names = []
     for sym in sym_list:
-        # Advance to the run containing this symbol
-        while run_idx < len(runs) - 1 and sym.addr >= runs[run_idx + 1][1]:
-            run_idx += 1
-        sec_name, sec_start, _ = runs[run_idx]
-        shndx = run_shndx[run_idx]
-        sym_value = run_offset[(sec_name, sec_start)] + (sym.addr - sec_start)
-        is_code = sec_name == '.text'
+        shndx, sym_value = layout.place(sym.addr)
+        is_code = sec_names[shndx - 1] == '.text'
         thumb = 1 if is_code and sym.mode == '$t' else 0
         sym_type = 0x12 if is_code else 0x11  # STT_FUNC / STT_OBJECT
         local_syms.append(SymbolTableEntry(len(local_strtab), sym_value, 0, 0x0, 0x0, shndx))
@@ -266,14 +293,48 @@ def _target_symtab(sym_list: list[Symbol], runs: list[tuple[str, int, int]],
             continue  # library code: leave these bytes unlabelled
         global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, sym.size,
                                             sym_type, 0, shndx))
+        global_names.append(sym.name)
         global_strtab += sym.name.encode('utf-8') + b'\x00'
+
+    for addr, kind in mapping:
+        shndx, value = layout.place(addr)
+        local_syms.append(SymbolTableEntry(len(local_strtab), value, 0, 0x0, 0x0, shndx))
+        local_strtab += kind.encode('utf-8') + b'\x00'
+
+    known = set(global_names)
+    for name in dict.fromkeys(r.symbol for r in relocs):
+        if name not in known:
+            known.add(name)
+            global_syms.append(SymbolTableEntry(len(global_strtab), 0, 0,
+                                                _STB_GLOBAL_NOTYPE, 0, 0))
+            global_names.append(name)
+            global_strtab += name.encode('utf-8') + b'\x00'
+
     for g_sym in global_syms:
         g_sym.name_off += len(local_strtab)
-    return local_syms, global_syms, bytes(local_strtab + global_strtab)
+    first_global = len(local_syms) + 1
+    index: dict[str, int] = {}
+    for i, name in enumerate(global_names):
+        index.setdefault(name, first_global + i)
+    return local_syms, global_syms, bytes(local_strtab + global_strtab), index
+
+
+def _rel_entries(relocs: list[TargetReloc], layout: _TargetLayout,
+                 sym_index: dict[str, int]) -> dict[int, list[tuple[int, int]]]:
+    """`(r_offset, r_info)` per section index, in offset order."""
+    entries: dict[int, list[tuple[int, int]]] = {}
+    for reloc in relocs:
+        shndx, offset = layout.place(reloc.addr)
+        entries.setdefault(shndx, []).append(
+            (offset, (sym_index[reloc.symbol] << 8) | reloc.rtype))
+    for rows in entries.values():
+        rows.sort()
+    return entries
 
 
 def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-locals
-                     sym_list: list[Symbol]):
+                     sym_list: list[Symbol], relocs: list[TargetReloc] | None = None,
+                     mapping: list[tuple[int, str]] | None = None):
     """Write a relocatable ELF with per-segment sections for objdiff targets.
 
     Symbols in the `std` namespace are written as bytes but left unnamed: the
@@ -282,7 +343,11 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     the range from total_code, total_functions and total_data alike. The
     `$a`/`$t`/`$d` mapping symbols stay, so the disassembler does not lose
     track of ARM/Thumb state across a discounted region.
+
+    `relocs` (see reloc.py) become one `.rel<section>` per section that has
+    any. `mapping` adds `(addr, '$d'|'$a'|'$t')` mapping symbols, for the literal pools.
     """
+    relocs = relocs or []
     runs = _segment_runs(sym_list, len(data))
 
     # A segment that stops and starts again produces two runs with one name,
@@ -297,8 +362,13 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     for name, start, end in runs:
         merged.setdefault(name, []).append((start, end))
     sec_names = list(merged)
+    layout = _TargetLayout(runs, sec_names)
 
-    local_syms, global_syms, strtab_bytes = _target_symtab(sym_list, runs, merged)
+    local_syms, global_syms, strtab_bytes, sym_index = _target_symtab(
+        sym_list, layout, sec_names, relocs, mapping or [])
+
+    rel_entries = _rel_entries(relocs, layout, sym_index)
+    rel_secs = sorted(rel_entries)
 
     writer = BinaryWriter()
     ELFHeader(0, 0, 0, True).write(writer)
@@ -326,49 +396,61 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     # Strtab
     strtab_off = writer.tell()
     writer.write_bytes(strtab_bytes)
+    pad_to_4(writer)
+
+    # Relocations
+    rel_offsets = []
+    for shndx in rel_secs:
+        rel_offsets.append(writer.tell())
+        for offset, info in rel_entries[shndx]:
+            writer.write_u32(offset)
+            writer.write_u32(info)
 
     # Shstrtab
     shstrtab_off = writer.tell()
     writer.write_u8(0)
-    sec_name_offsets = []
-    for name in sec_names:
-        sec_name_offsets.append(writer.tell() - shstrtab_off)
+    name_offs = []
+    for name in [*sec_names, '.symtab', '.strtab', '.shstrtab',
+                 *('.rel' + sec_names[shndx - 1] for shndx in rel_secs)]:
+        name_offs.append(writer.tell() - shstrtab_off)
         writer.write_str(name)
-    symtab_name_off = writer.tell() - shstrtab_off
-    writer.write_str('.symtab')
-    strtab_name_off = writer.tell() - shstrtab_off
-    writer.write_str('.strtab')
-    shstrtab_name_off = writer.tell() - shstrtab_off
-    writer.write_str('.shstrtab')
+    shstrtab_end = writer.tell()
     pad_to_4(writer)
+    num_sections = len(sec_names)
+    symtab_name_off, strtab_name_off, shstrtab_name_off = name_offs[num_sections:
+                                                                    num_sections + 3]
 
     # Section header table
     sh_off = writer.tell()
-    num_sections = len(sec_names)
+    symtab_idx = num_sections + 1
     # [0] NULL
     SectionHeaderEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0).write(writer)
     # [1..N] data sections
     for i, name in enumerate(sec_names):
         sh_type, sh_flags = _SECTION_FLAGS.get(name, _DEFAULT_SECTION_FLAGS)
-        SectionHeaderEntry(sec_name_offsets[i], sh_type, sh_flags, 0,
+        SectionHeaderEntry(name_offs[i], sh_type, sh_flags, 0,
                            sec_offsets[i], sec_sizes[i], 0, 0, 0, 4).write(writer)
     # symtab: link=strtab index, info=first global
-    symtab_link = num_sections + 2  # .strtab section index
     SectionHeaderEntry(symtab_name_off, SectionHeaderType.SHT_SYMTAB, 0, 0, symtab_off,
-                       strtab_off - symtab_off, symtab_link,
+                       strtab_off - symtab_off, symtab_idx + 1,
                        len(local_syms) + 1, 0x10).write(writer)
     # strtab
     SectionHeaderEntry(strtab_name_off, SectionHeaderType.SHT_STRTAB, 0, 0, strtab_off,
                        len(strtab_bytes), 0, 0, 0).write(writer)
     # shstrtab
     SectionHeaderEntry(shstrtab_name_off, SectionHeaderType.SHT_STRTAB, 0, 0, shstrtab_off,
-                       sh_off - shstrtab_off, 0, 0, 0, 0).write(writer)
+                       shstrtab_end - shstrtab_off, 0, 0, 0, 0).write(writer)
+    # [N+4..] one REL section per relocated section
+    for i, shndx in enumerate(rel_secs):
+        SectionHeaderEntry(name_offs[num_sections + 3 + i], SectionHeaderType.SHT_REL,
+                           _SHF_INFO_LINK, 0, rel_offsets[i], 8 * len(rel_entries[shndx]),
+                           symtab_idx, shndx, 8).write(writer)
 
     # Patch header
-    total_sh = num_sections + 4  # NULL + data sections + symtab + strtab + shstrtab
+    total_sh = num_sections + 4 + len(rel_secs)
     writer.seek(0x20)
     writer.write_u32(sh_off)
     writer.seek(0x30)
     writer.write_u16(total_sh)
-    writer.write_u16(total_sh - 1)  # shstrndx = last section
+    writer.write_u16(num_sections + 3)  # shstrndx
     writer.flush(out_path)

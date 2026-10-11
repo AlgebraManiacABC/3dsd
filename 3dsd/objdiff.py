@@ -10,7 +10,9 @@ import sys
 from pathlib import Path
 
 from .config import ProjectConfig
+from .ctrtype import CRO, CTRBinary
 from .elf import SectionHeaderType, write_target_elf
+from .reloc import RelocRecovery, read_base
 from .util import Symbol, posix, sanitize
 
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
@@ -126,20 +128,46 @@ def _skip_data_padding(symbols: list[Symbol]) -> list[Symbol]:
 
 
 def generate_target_elfs(config: ProjectConfig):
-    """Wrap each original binary as an ELF with symbols from the CSV."""
+    """Wrap each original binary as an ELF with symbols from the CSV.
+
+    Where the base ELF has already been linked, the target also gets the
+    relocations its compiled twin implies (see reloc.py); without them a
+    function that calls anything can never match.
+    """
     target_dir = config.out_dir / 'objdiff_target'
     target_dir.mkdir(parents=True, exist_ok=True)
     for name, binary in config.binaries.items():
         data = binary.data
         decompiled = config.get_decompiled_data(name)
-        raw = _route_data(config.symbols.get(name, []), decompiled)
+        csv = config.symbols.get(name, [])
+        raw = _route_data(csv, decompiled)
         syms = _skip_data_padding(_complete_symbols(raw, len(data)))
+        data, relocs, mapping, rel_note = _recover_relocs(config, name, binary, csv, syms)
         out = target_dir / name
-        write_target_elf(out, data, syms)
+        write_target_elf(out, data, syms, relocs, mapping)
         std_bytes = sum(s.size for s in syms if s.is_stdlib)
         labelled = len(syms) - sum(1 for s in syms if s.is_stdlib)
         note = f", {std_bytes:,} std bytes discounted" if std_bytes else ""
-        print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note} -> {out}")
+        print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note}{rel_note} -> {out}")
+
+
+def _recover_relocs(config: ProjectConfig, name: str, binary: CTRBinary,
+                    csv: list[Symbol], syms: list[Symbol]):
+    """`(data, relocs, mapping, note)`: the target's bytes, relocations and
+    literal-pool mapping symbols, recovered against its base."""
+    base_path = config.out_dir / 'objdiff_base' / name
+    base = read_base(base_path.read_bytes()) if base_path.exists() else None
+    if base is None:
+        return binary.data, [], [], ''
+    # A CRO's pointers are fixed up at load time, so its pool words hold no
+    # addresses to look up; its branches are pc-relative and still resolve.
+    recovery = RelocRecovery(binary.data, csv, base, binary.base_addr,
+                             pointers=not isinstance(binary.binary, CRO))
+    data, relocs = recovery.run(syms)
+    note = f", {len(relocs):,} relocations"
+    if recovery.unresolved:
+        note += f" ({recovery.unresolved:,} references reach no CSV symbol)"
+    return data, relocs, recovery.mapping, note
 
 
 def generate_objdiff(config: ProjectConfig):
