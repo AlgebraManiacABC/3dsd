@@ -417,8 +417,9 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     shstrtab_end = writer.tell()
     pad_to_4(writer)
     num_sections = len(sec_names)
-    symtab_name_off, strtab_name_off, shstrtab_name_off = name_offs[num_sections:
-                                                                    num_sections + 3]
+    symtab_name_off = name_offs[num_sections]
+    strtab_name_off = name_offs[num_sections + 1]
+    shstrtab_name_off = name_offs[num_sections + 2]
 
     # Section header table
     sh_off = writer.tell()
@@ -427,7 +428,8 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     SectionHeaderEntry(0, 0, 0, 0, 0, 0, 0, 0, 0, 0).write(writer)
     # [1..N] data sections
     for i, name in enumerate(sec_names):
-        sh_type, sh_flags = _SECTION_FLAGS.get(name, _DEFAULT_SECTION_FLAGS)
+        # A split object's section ('.data:gTable') takes its parent's flags.
+        sh_type, sh_flags = _SECTION_FLAGS.get(name.partition(':')[0], _DEFAULT_SECTION_FLAGS)
         SectionHeaderEntry(name_offs[i], sh_type, sh_flags, 0,
                            sec_offsets[i], sec_sizes[i], 0, 0, 0, 4).write(writer)
     # symtab: link=strtab index, info=first global

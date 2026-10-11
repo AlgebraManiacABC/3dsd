@@ -374,7 +374,11 @@ objdiff reports them that way:
 - **Fuzzy Code %** — partial credit for functions still in progress, so it is
   always ≥ *Code %*.
 - **Data bytes / Data %** — matched data out of `total_data`. objdiff credits
-  a data section only once it matches completely.
+  a data section only once it matches completely, so every decompiled object
+  is given a section of its own (`.rodata:gEnts`, `.data:gTable`) in both the
+  base and the target: each one that matches exactly counts, whatever the
+  others do. These are not the original translation units, only a finer
+  grain for the same measurement.
 - **Fuzzy Data %** — how far along the data is: the size-weighted mean of
   objdiff's per-section fuzzy percentages, which objdiff does not total itself.
 - **Total bytes / Total %** — code and data together, the closest thing to
