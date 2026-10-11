@@ -149,6 +149,7 @@ class Symbol:
 class RelocationType(IntEnum):
     """ARM ELF relocation types; unlisted values become R_ARM_UNKNOWN_<n>."""
     R_ARM_NONE = 0
+    R_ARM_PC24 = 1
     R_ARM_ABS32 = 2
     R_ARM_REL32 = 3
     R_ARM_THM_PC22 = 10
@@ -157,6 +158,8 @@ class RelocationType(IntEnum):
     R_ARM_TARGET1 = 38
     R_ARM_V4BX = 40
     R_ARM_PREL31 = 42
+    R_ARM_THM_JUMP11 = 102
+    R_ARM_THM_JUMP8 = 103
 
     @classmethod
     def _missing_(cls, value):

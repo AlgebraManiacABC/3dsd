@@ -338,6 +338,16 @@ data object it finds that the symbol CSV also names.
   pool after them inside the function's own section, so the compiled symbol is
   often a few bytes longer; objdiff diffs over the target symbol's extent and
   still scores such a function 100%.
+- **Calls and addresses**: the objdiff target is cut from a linked binary, so
+  every call and address load in it is already resolved, while the base's are
+  relocations. For each symbol the base defines, the target gets the
+  relocations its compiled twin implies: `bl`/`blx`/`b` and literal-pool
+  words are found by a masked search, the address each reaches is named from
+  the symbol CSV, and the bytes are put back in unlinked form. Without this
+  no function that calls anything could reach 100%. Name callees and globals
+  in the CSV as the compiler does, or the relocations will not pair. String
+  literals and statics, which armcc refers to through their section, are
+  matched by content instead. See `3dsd/reloc.py`.
 
 `3dsd ninja` compiles every source once to do this discovery (in parallel,
 cached in `build/`); on an 1,800-file project that is around 20 seconds cold
