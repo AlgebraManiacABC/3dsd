@@ -208,11 +208,11 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
     if after_compiled:
         print(f"    {len(after_compiled):,} directly follow a decompiled function "
               f"(likely its literal pool, left uncompared):")
-        for pad in after_compiled[:10]:
+        for pad in after_compiled[:5]:
             print(f"      {base_addr + pad.addr:08x} +{pad.size:<5} after "
                   f"{previous[pad.addr].name}")
-        if len(after_compiled) > 10:
-            print(f"      ... and {len(after_compiled) - 10:,} more")
+        if len(after_compiled) > 5:
+            print(f"      ... and {len(after_compiled) - 5:,} more")
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,
