@@ -140,6 +140,7 @@ class BaseObject:
     def __init__(self, names: list[str], contents: list[bytes | None],
                  symbols: list[BaseSymbol], relocs: dict[int, list[BaseReloc]]):
         self.names = names
+        self._index = {name: i for i, name in enumerate(names)}
         self.contents = contents
         self.relocs = relocs
         self.by_name: dict[str, list[BaseSymbol]] = {}
@@ -166,6 +167,12 @@ class BaseObject:
         for sym in self.by_name.get(name, []):
             if self.names[sym.shndx] == section and sym.size:
                 return sym
+        # A section holding a single split object (`.pool:<function>`) pairs
+        # whole, whatever each side calls the object in it.
+        shndx = self._index.get(section) if ':' in section else None
+        inside = self._named.get(shndx, []) if shndx is not None else []
+        if len(inside) == 1:
+            return inside[0]
         return None
 
     def relocs_in(self, sym: BaseSymbol) -> dict[int, BaseReloc]:
