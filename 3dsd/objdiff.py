@@ -1,6 +1,7 @@
 """objdiff integration: target ELFs, objdiff.json, the base link and progress."""
 
 import ctypes
+import itertools
 import json
 import os
 import shutil
@@ -100,12 +101,21 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
     datasplit.py) goes to the section of the same name, so it pairs, and
     scores, alone.
 
+    A `$d` label in .text is data too, never a function, and goes with the
+    undecompiled data: nothing compiled pairs with it.
+
     Applied before the gaps are filled, so the padding between two undecompiled
     data objects inherits the skipped segment too and stays out of the diff.
     """
     split = split or {}
     out = []
     for sym in symbols:
+        if sym.segment == '.text' and sym.mode == '$d':
+            # Data inside the code segment -- a literal pool, a jump table --
+            # labelled as such in the CSV: measured as undecompiled data.
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
+                              SKIP_SEGMENT, sym.namespace))
+            continue
         if sym.segment not in DATA_SEGMENTS:
             out.append(sym)
             continue
@@ -159,6 +169,8 @@ def generate_target_elfs(config: ProjectConfig):
         split = split_sections_of(base.names) if base is not None else {}
         raw = _route_data(csv, decompiled, split)
         syms = _skip_data_padding(_complete_symbols(raw, len(data)))
+        _warn_unnamed(name, syms, binary.base_addr,
+                      set(base.by_name) if base is not None else set())
         data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms)
         out = target_dir / name
         write_target_elf(out, data, syms, relocs, mapping)
@@ -166,6 +178,41 @@ def generate_target_elfs(config: ProjectConfig):
         labelled = len(syms) - sum(1 for s in syms if s.is_stdlib)
         note = f", {std_bytes:,} std bytes discounted" if std_bytes else ""
         print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note}{rel_note} -> {out}")
+
+
+def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[str]):
+    """Report the bytes the symbol CSV leaves unnamed.
+
+    The pipeline cannot tell what such a region is -- ARM code, Thumb code,
+    or data such as a literal pool -- so it is written as an unnamed `pad_`
+    symbol: code in .text, where objdiff counts it as an unmatched function,
+    or undecompiled data elsewhere. Only the CSV can say otherwise, so the
+    gaps are listed for it to be filled in. Those right after a compiled
+    function come first: they are most often its literal pool, which objdiff
+    then never compares.
+    """
+    pads = [s for s in syms if s.name.startswith('pad_') and not s.is_stdlib]
+    if not pads:
+        return
+    code = [p for p in pads if p.segment == '.text']
+    code_bytes = sum(p.size for p in code)
+    data_bytes = sum(p.size for p in pads) - code_bytes
+    print(f"  Warning: {name}: {len(pads):,} region(s) the symbol CSV does not name "
+          f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
+          f"Label them as $a/$t/$d in the CSV.")
+    previous = {}
+    for before, sym in itertools.pairwise(syms):
+        previous[sym.addr] = before
+    after_compiled = [p for p in code
+                      if previous.get(p.addr) is not None and previous[p.addr].name in compiled]
+    if after_compiled:
+        print(f"    {len(after_compiled):,} directly follow a decompiled function "
+              f"(likely its literal pool, left uncompared):")
+        for pad in after_compiled[:10]:
+            print(f"      {base_addr + pad.addr:08x} +{pad.size:<5} after "
+                  f"{previous[pad.addr].name}")
+        if len(after_compiled) > 10:
+            print(f"      ... and {len(after_compiled) - 10:,} more")
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,
