@@ -334,10 +334,13 @@ data object it finds that the symbol CSV also names.
   are folded silently, as the linker would. Two files with the same **strong**
   definition will still break the objdiff base link — that is a genuine
   conflict in the sources, not something to paper over.
-- Keep a function's CSV size to its instructions. armcc places the literal
-  pool after them inside the function's own section, so the compiled symbol is
-  often a few bytes longer; objdiff diffs over the target symbol's extent and
-  still scores such a function 100%.
+- Keep a function's CSV size to its instructions, as armcc's own symbol is.
+  The literal pool after them is measured as data, not code: on both sides it
+  becomes an object `<function>$pool` in a section `.pool:<function>`, found
+  by following the function's pc-relative loads. A decompiled function's pool
+  pairs with the compiled one, so a wrong constant or address shows up in the
+  data figures instead of passing unseen; undecompiled pools count as
+  undecompiled data rather than as unmatched `pad_` "functions".
 - **Calls and addresses**: the objdiff target is cut from a linked binary, so
   every call and address load in it is already resolved, while the base's are
   relocations. For each symbol the base defines, the target gets the

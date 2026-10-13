@@ -29,13 +29,18 @@ Splitting an object out of `.rodata` means three things:
 
 The original bytes stay where they were, unlabelled. Nothing else in the
 section moves, so no other offset needs rewriting.
+
+Each function's trailing literal pool is split out the same way, as a new
+object `<function>$pool` in `.pool:<function>` (see pools.py), so pools are
+measured as data on both sides.
 """
 
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from .elf import ELFHeader, SectionHeaderType
+from .elf import ELFHeader, SectionHeaderFlags, SectionHeaderType
+from .pools import POOL_SEGMENT, pool_section, pool_symbol, trailing_pool
 from .util import RelocationType, get_name
 
 #: The base.ld output sections whose objects are given sections of their own.
@@ -43,7 +48,9 @@ SPLIT_FROM = ('.rodata', '.data')
 
 _SEP = ':'
 _STT_OBJECT = 1
+_STT_FUNC = 2
 _STT_SECTION = 3
+_GLOBAL_OBJECT = 0x11
 _SHF_INFO_LINK = 0x40
 #: One object is neither mergeable nor a string table, whatever its parent was.
 _SHF_MERGE_STRINGS = 0x30
@@ -61,6 +68,8 @@ def split_sections_of(section_names: list[str]) -> dict[str, str]:
         parent, sep, name = sec.partition(_SEP)
         if sep and parent in SPLIT_FROM and name:
             found[name] = sec
+        elif sep and parent == POOL_SEGMENT and name:
+            found[pool_symbol(name)] = sec
     return found
 
 
@@ -83,6 +92,8 @@ class _Object:
     start: int
     end: int
     new_shndx: int
+    section: str
+    flags: int
 
 
 def _read(data: bytes) -> list[_Section] | None:
@@ -163,16 +174,17 @@ def split_data_objects(path: Path) -> int:
             for j in range(len(symtab.data) // 0x10)]
     names = [get_name(strtab, s[0]) if s[0] < len(strtab) else '' for s in syms]
 
-    objects = _choose(sections, syms, names)
+    pools = _add_pool_symbols(sections, syms, names, symtab.link)
+    objects = _choose(sections, syms, names) + pools
     if not objects:
         return 0
 
     # New data sections first, so their indices are known before the REL ones.
     by_parent: dict[int, list[_Object]] = {}
     first_new = len(sections)
-    for k, (shndx, sym_idx) in enumerate(objects):
+    for k, (shndx, sym_idx, sec_name, flags) in enumerate(objects):
         start = syms[sym_idx][1]
-        obj = _Object(sym_idx, start, start + syms[sym_idx][2], first_new + k)
+        obj = _Object(sym_idx, start, start + syms[sym_idx][2], first_new + k, sec_name, flags)
         by_parent.setdefault(shndx, []).append(obj)
     for objs in by_parent.values():
         objs.sort(key=lambda o: o.start)
@@ -185,10 +197,9 @@ def split_data_objects(path: Path) -> int:
     for shndx, objs in by_parent.items():
         parent = sections[shndx]
         for obj in objs:
-            name = split_section_name(parent.name, names[obj.sym_idx])
             align = obj.start & -obj.start or parent.align
             new_sections.append((obj.new_shndx, _Section(
-                name, SectionHeaderType.SHT_PROGBITS, parent.flags & ~_SHF_MERGE_STRINGS, 0, 0,
+                obj.section, SectionHeaderType.SHT_PROGBITS, obj.flags, 0, 0,
                 min(align, max(parent.align, 1)), 0,
                 bytearray(parent.data[obj.start:obj.end]))))
             syms[obj.sym_idx][1] = 0
@@ -205,8 +216,9 @@ def split_data_objects(path: Path) -> int:
 
 
 def _choose(sections: list[_Section], syms: list[list[int]],
-            names: list[str]) -> list[tuple[int, int]]:
-    """`(shndx, symbol index)` of every object worth a section of its own."""
+            names: list[str]) -> list[tuple[int, int, str, int]]:
+    """`(shndx, symbol index, new section, flags)` of every object worth a
+    section of its own."""
     counts: dict[str, int] = {}
     for name in names:
         if name:
@@ -218,7 +230,49 @@ def _choose(sections: list[_Section], syms: list[list[int]],
         sec = sections[shndx]
         if (sec.name in SPLIT_FROM and sec.type == SectionHeaderType.SHT_PROGBITS
                 and counts.get(names[j]) == 1 and value + size <= len(sec.data)):
-            chosen.append((shndx, j))
+            chosen.append((shndx, j, split_section_name(sec.name, names[j]),
+                           sec.flags & ~_SHF_MERGE_STRINGS))
+    return chosen
+
+
+def _add_pool_symbols(sections: list[_Section], syms: list[list[int]], names: list[str],
+                      strtab_idx: int) -> list[tuple[int, int, str, int]]:
+    """Give each function's trailing literal pool a symbol, and choose it.
+
+    The pool is found as pools.py finds it in the target, so both sides agree
+    on its extent. The new symbols are appended as globals, after every
+    local, as the symbol table requires.
+    """
+    counts: dict[str, int] = {}
+    for name in names:
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    by_section: dict[int, list[tuple[int, int, int]]] = {}
+    for j, (_, value, size, info, _other, shndx) in enumerate(syms):
+        if info & 0xF in (_STT_FUNC, _STT_OBJECT) and size and 0 < shndx < len(sections):
+            by_section.setdefault(shndx, []).append((value & ~1, j, value & 1))
+
+    strtab = sections[strtab_idx].data
+    chosen = []
+    for shndx, entries in by_section.items():
+        sec = sections[shndx]
+        if not sec.flags & SectionHeaderFlags.SHF_EXECINSTR:
+            continue
+        entries.sort()
+        for k, (start, j, thumb) in enumerate(entries):
+            if syms[j][3] & 0xF != _STT_FUNC or counts.get(names[j]) != 1:
+                continue
+            end = start + syms[j][2]
+            limit = entries[k + 1][0] if k + 1 < len(entries) else len(sec.data)
+            pool_end = trailing_pool(bytes(sec.data), start, end, bool(thumb), limit)
+            if pool_end == end:
+                continue
+            name = pool_symbol(names[j])
+            syms.append([len(strtab), end, pool_end - end, _GLOBAL_OBJECT, 0, shndx])
+            names.append(name)
+            strtab += name.encode('utf-8') + b'\x00'
+            chosen.append((shndx, len(syms) - 1, pool_section(names[j]),
+                           int(SectionHeaderFlags.SHF_ALLOC)))
     return chosen
 
 

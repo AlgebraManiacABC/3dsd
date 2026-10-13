@@ -1,5 +1,6 @@
 """objdiff integration: target ELFs, objdiff.json, the base link and progress."""
 
+import bisect
 import ctypes
 import json
 import os
@@ -13,6 +14,7 @@ from .config import ProjectConfig
 from .ctrtype import CRO, CTRBinary
 from .datasplit import split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
+from .pools import POOL_SEGMENT, pool_symbol, trailing_pool
 from .reloc import BaseObject, RelocRecovery, read_base
 from .util import Symbol, posix, sanitize
 
@@ -138,7 +140,36 @@ def _skip_data_padding(symbols: list[Symbol]) -> list[Symbol]:
 
 def _is_data(segment: str) -> bool:
     """Whether a segment pairs with base data: `.rodata`, `.data`, or one object's own."""
-    return segment in DATA_SEGMENTS or segment.partition(':')[0] in DATA_SEGMENTS
+    parent = segment.partition(':')[0]
+    return segment in DATA_SEGMENTS or parent in DATA_SEGMENTS or parent == POOL_SEGMENT
+
+
+def _add_pools(symbols: list[Symbol], data: bytes, split: dict[str, str]) -> list[Symbol]:
+    """Add each function's trailing literal pool as a data object (see pools.py).
+
+    A pool the base has given a section pairs with it; any other goes with
+    the rest of the undecompiled data. Library functions keep theirs as code,
+    where the `std` discount already removes it from the totals -- as data it
+    would count, since objdiff measures data by section.
+    """
+    in_file = sorted((s for s in symbols if 0 <= s.addr < len(data)), key=lambda s: s.addr)
+    starts = [s.addr for s in in_file]
+    out = list(symbols)
+    for sym in in_file:
+        if (sym.segment != '.text' or sym.is_stdlib or sym.size <= 0
+                or sym.mode not in ('$a', '$t')):
+            continue
+        end = sym.addr + sym.size
+        nxt = bisect.bisect_right(starts, sym.addr)
+        limit = starts[nxt] if nxt < len(starts) else len(data)
+        if limit <= end:
+            continue
+        pool_end = trailing_pool(data, sym.addr, end, sym.mode == '$t', limit)
+        if pool_end > end:
+            name = pool_symbol(sym.name)
+            out.append(Symbol(end, name, '$d', pool_end - end,
+                              split.get(name, SKIP_SEGMENT), sym.namespace))
+    return out
 
 
 def generate_target_elfs(config: ProjectConfig):
@@ -157,7 +188,7 @@ def generate_target_elfs(config: ProjectConfig):
         base_path = config.out_dir / 'objdiff_base' / name
         base = read_base(base_path.read_bytes()) if base_path.exists() else None
         split = split_sections_of(base.names) if base is not None else {}
-        raw = _route_data(csv, decompiled, split)
+        raw = _add_pools(_route_data(csv, decompiled, split), data, split)
         syms = _skip_data_padding(_complete_symbols(raw, len(data)))
         data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms)
         out = target_dir / name
