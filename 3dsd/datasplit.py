@@ -254,26 +254,27 @@ def _add_pool_symbols(sections: list[_Section], syms: list[list[int]], names: li
                       strtab_idx: int) -> list[tuple[int, int, str, int]]:
     """Give each function's trailing literal pool a symbol, and choose it.
 
-    armcc marks where a pool begins with a `$d` mapping symbol, so the pool is
-    read off the compiler's own output rather than worked out: it starts at a
-    `$d` within alignment of the function's end, and runs to the next mapping
-    symbol, the next sized symbol or the end of the section. The target
-    pairs its `$d` label after the same function with it (`_route_data` in
-    objdiff.py). The new symbols are appended as globals, after every local,
+    armcc marks where data begins with a `$d` mapping symbol, so the pool is
+    read off the compiler's own output rather than worked out: it starts at
+    the first `$d` after the function's end and runs, across any further
+    `$d`, to the next `$a`/`$t`, the next sized symbol or the end of the
+    section. The target pairs the `$d` labels after the same function with it
+    (`_route_data` in objdiff.py). The new symbols are appended as globals, after every local,
     as the symbol table requires.
     """
     counts = _name_counts(names)
-    marks: dict[int, list[int]] = {}
+    code_marks: dict[int, list[int]] = {}
+    data_marks: dict[int, list[int]] = {}
     sized: dict[int, list[tuple[int, int]]] = {}
     for j, (_, value, size, info, _other, shndx) in enumerate(syms):
         if not 0 < shndx < len(sections):
             continue
-        if any(_is_mapping(names[j], kind) for kind in ('$a', '$t', '$d')):
-            marks.setdefault(shndx, []).append(value)
+        if _is_mapping(names[j], '$d'):
+            data_marks.setdefault(shndx, []).append(value)
+        elif _is_mapping(names[j], '$a') or _is_mapping(names[j], '$t'):
+            code_marks.setdefault(shndx, []).append(value)
         elif size and info & 0xF in (_STT_FUNC, _STT_OBJECT):
             sized.setdefault(shndx, []).append((value & ~1, j))
-    data_marks = {(syms[j][5], syms[j][1]) for j in range(len(syms))
-                  if _is_mapping(names[j], '$d')}
 
     strtab = sections[strtab_idx].data
     chosen = []
@@ -282,12 +283,14 @@ def _add_pool_symbols(sections: list[_Section], syms: list[list[int]], names: li
         if not sec.flags & SectionHeaderFlags.SHF_EXECINSTR:
             continue
         entries.sort()
-        bounds = sorted({*marks.get(shndx, []), *(e[0] for e in entries), len(sec.data)})
+        bounds = sorted({*code_marks.get(shndx, []), *(e[0] for e in entries), len(sec.data)})
+        starts = sorted(data_marks.get(shndx, []))
         for start, j in entries:
             if syms[j][3] & 0xF != _STT_FUNC or counts.get(names[j]) != 1:
                 continue
             end = start + syms[j][2]
-            pool = next((a for a in range(end, end + 4) if (shndx, a) in data_marks), None)
+            limit = next(b for b in bounds if b >= end)
+            pool = next((a for a in starts if end <= a < limit), None)
             if pool is None:
                 continue
             pool_end = next(b for b in bounds if b > pool)

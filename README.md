@@ -64,10 +64,11 @@ counts as an unmatched function. The commonest gap is a function's literal
 pool, which armcc places right after the function's last instruction, outside
 its symbol. Each build lists the gaps, those right after a decompiled
 function first. Label them in the CSV: a `$d` entry in `.text` is measured as
-data, not code. One that starts within alignment of a decompiled function's
-end is that function's pool and is compared with the pool armcc emitted (cut
-at armcc's own `$d` mapping symbol), so a wrong constant or address shows in
-the data figures; any other goes with the undecompiled data.
+data, not code. Every `$d` label between a decompiled function and the next
+code symbol belongs to that function's pool, gaps between them included, and
+the pool is compared with the one armcc emitted (cut at armcc's own `$d`
+mapping symbols), so a wrong constant or address shows in the data figures.
+Any other `$d` label goes with the undecompiled data.
 
 Put the title's `exheader.bin` in `orig/` too. It records where `code.bin`'s
 `.text`, `.rodata` and `.data` really begin and end, and when it is present

@@ -102,11 +102,11 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
     datasplit.py) goes to the section of the same name, so it pairs, and
     scores, alone.
 
-    A `$d` label in .text is data too, never a function. When it sits right
-    after a function whose compiled pool the base has split out (`pools`),
-    it is that function's literal pool and goes to the same `.pool:<function>`
-    section, so the two are compared; any other goes with the undecompiled
-    data.
+    A `$d` label in .text is data too, never a function. Every one between a
+    function whose compiled pool the base has split out (`pools`) and the next
+    code symbol belongs to that function's literal pool and goes to the same
+    `.pool:<function>` section, so the two are compared; any other goes with
+    the undecompiled data.
 
     Applied before the gaps are filled, so the padding between two undecompiled
     data objects inherits the skipped segment too and stays out of the diff.
@@ -135,35 +135,42 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
 
 
 def _pool_owners(symbols: list[Symbol], pools: set[str]) -> dict[int, str]:
-    """`{id(label): function}` for each `$d` label in .text that is the pool of
-    a function in `pools`: the first `$d` within alignment of its end."""
+    """`{id(label): function}` for each `$d` label in .text that follows a
+    function in `pools`, up to the next code symbol."""
     owners: dict[int, str] = {}
     text = sorted((s for s in symbols if s.segment == '.text'), key=lambda s: s.addr)
-    last = None
+    owner = None
     for sym in text:
         if sym.mode in ('$a', '$t'):
-            last = sym
-        elif (last is not None and last.name in pools
-              and 0 <= sym.addr - (last.addr + last.size) < 4):
-            owners[id(sym)] = last.name
-            last = None
+            owner = sym.name if sym.name in pools else None
+        elif owner is not None:
+            owners[id(sym)] = owner
     return owners
 
 
 def _keep_text_gaps(symbols: list[Symbol], csv: list[Symbol]) -> list[Symbol]:
-    """Leave a gap after a `$d` label in .text in .text.
+    """Settle the gaps after `$d` labels in .text.
 
-    A gap takes the segment of the symbol before it, which for a pool now
-    routed as data would quietly count whatever unnamed bytes follow it --
-    alignment, or code nobody has labelled -- as data. What they are is for
-    the CSV to say, so they stay with the code segment they sit in.
+    A gap between two labels of the same pool is part of that pool: the
+    compiled pool runs unbroken from its first word to its last, so leaving
+    the gap out would make the two differ by its bytes. Any other gap after a
+    label stays code. It would otherwise take the label's data segment and
+    quietly count whatever unnamed bytes follow -- alignment, or code nobody
+    has labelled -- as data; what they are is for the CSV to say.
+
+    Runs after `_skip_data_padding`, which would send the pool's own gaps
+    to the undecompiled data.
     """
     label_ends = {s.addr + s.size for s in csv if s.segment == '.text' and s.mode == '$d'}
-    out = []
-    for sym in symbols:
-        if sym.name.startswith('pad_') and sym.addr in label_ends:
-            sym = Symbol(sym.addr, sym.name, sym.mode, sym.size, '.text', sym.namespace)
-        out.append(sym)
+    out = list(symbols)
+    for i, sym in enumerate(out):
+        if not sym.name.startswith('pad_') or sym.addr not in label_ends:
+            continue
+        before = out[i - 1].segment if i > 0 else None
+        after = out[i + 1].segment if i + 1 < len(out) else None
+        in_pool = before is not None and before == after and before.startswith(POOL_SEGMENT)
+        segment = before if in_pool else '.text'
+        out[i] = Symbol(sym.addr, sym.name, sym.mode, sym.size, segment, sym.namespace)
     return out
 
 
@@ -211,7 +218,7 @@ def generate_target_elfs(config: ProjectConfig):
         pools = {n.partition(':')[2] for n in base.names
                  if n.startswith(POOL_SEGMENT + ':')} if base is not None else set()
         raw = _route_data(csv, decompiled, split, pools)
-        syms = _skip_data_padding(_keep_text_gaps(_complete_symbols(raw, len(data)), csv))
+        syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
         _warn_unnamed(name, syms, binary.base_addr,
                       set(base.by_name) if base is not None else set())
         data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms)

@@ -451,8 +451,15 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
         symbol per function, so without these a pool decodes as instructions,
         and in Thumb a relocated pool word then straddles two of them.
         """
+        # A split section ('.pool:Func', '.rodata:gTable') is one object in the
+        # base but may be several labels in the target -- a pool the CSV marks
+        # word by word -- so it is handled whole, from its first byte.
+        split: dict[str, list[Symbol]] = {}
         for sym in syms:
             if sym.is_stdlib or sym.name.startswith('pad_'):
+                continue
+            if ':' in sym.segment:
+                split.setdefault(sym.segment, []).append(sym)
                 continue
             twin = self.base.twin(sym.name, sym.segment)
             if twin is None:
@@ -461,6 +468,12 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
                 self._function(sym, twin)
             else:
                 self._data(sym, twin)
+        for segment, parts in split.items():
+            twin = self.base.twin(parts[0].name, segment)
+            if twin is not None:
+                start = min(p.addr for p in parts)
+                end = max(p.addr + p.size for p in parts)
+                self._data(Symbol(start, parts[0].name, '$d', end - start, segment), twin)
         return bytes(self.data), self.relocs
 
     def _function(self, sym: Symbol, twin: BaseSymbol):
