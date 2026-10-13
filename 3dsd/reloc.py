@@ -422,6 +422,7 @@ class _CsvIndex:
     def __init__(self, symbols: list[Symbol]):
         self.syms = sorted(symbols, key=lambda s: s.addr)
         self.addrs = [s.addr for s in self.syms]
+        self.by_name = {s.name: s for s in self.syms}
 
     def containing(self, off: int) -> Symbol | None:
         """The symbol whose extent covers `off`; a sized one wins over a label."""
@@ -629,12 +630,41 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
 
         if rtype != RelocationType.R_ARM_ABS32:
             reach = self._through_veneer(reach)
+
+        # A named reference in the twin: one address has as many names as the
+        # CSV gives the symbols around it (`_ZTV...+8` and a label at the same
+        # byte), and objdiff compares names, not addresses. So the twin's own
+        # name is used whenever the CSV symbol of that name reaches the same
+        # byte with the same addend; the nearest CSV symbol is the fallback.
+        for opt in options:
+            if opt.sym.kind == _STT_SECTION or not _same_class(opt.rtype, rtype):
+                continue
+            sym = self.csv.by_name.get(opt.sym.name)
+            if sym is not None and self._addend(sym, reach, rtype) == opt.addend:
+                for key in [k for k, v in unused.items() if v is opt]:
+                    del unused[key]
+                self._add(cand, rtype, sym.name, opt.addend)
+                return
+
         target = self._resolve(reach, rtype)
         if target is None:
             self.unresolved += 1
             return
         sym, addend = target
         self._add(cand, rtype, sym.name, addend)
+
+    @staticmethod
+    def _addend(sym: Symbol, reach: int, rtype: int) -> int | None:
+        """The addend that reaches `reach` from `sym`, if `sym` covers it."""
+        thumb = 1 if sym.mode == '$t' and sym.segment == '.text' else 0
+        if rtype == RelocationType.R_ARM_ABS32:
+            start = sym.addr | thumb if reach & 1 else sym.addr
+            if not sym.addr <= reach - (reach & thumb) < sym.addr + max(sym.size, 1):
+                return None
+            return reach - start
+        if not sym.addr <= reach < sym.addr + max(sym.size, 1):
+            return None
+        return reach - sym.addr - _PC_BIAS[rtype]
 
     def _through_veneer(self, reach: int) -> int:
         """Where a branch really goes, if it lands on a linker veneer.
