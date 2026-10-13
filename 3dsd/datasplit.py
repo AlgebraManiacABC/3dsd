@@ -35,8 +35,9 @@ Each function's trailing literal pool is split out the same way, into
 function is compared, as data, against the one armcc emitted.
 """
 
+import bisect
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .elf import ELFHeader, SectionHeaderFlags, SectionHeaderType
@@ -91,14 +92,52 @@ class _Section:  # pylint: disable=too-many-instance-attributes
     nobits_size: int = 0
 
 
-@dataclass(frozen=True)
-class _Object:  # pylint: disable=too-many-instance-attributes
+@dataclass
+class _Plan:  # pylint: disable=too-many-instance-attributes
+    """One new section: which bytes of its parent go there, and what moves with them.
+
+    `ranges` are copied in order and laid end to end, which is how a function
+    loses the pools in its middle: its code ranges make one section, its data
+    ranges (and trailing pool) another. `moves` are further symbols -- the
+    function's own `$a`/`$t` mapping symbols -- that follow their bytes.
+    """
+    parent: int
     sym_idx: int
-    start: int
-    end: int
-    new_shndx: int
     section: str
     flags: int
+    ranges: list[tuple[int, int]]
+    moves: list[int] = field(default_factory=list)
+    new_shndx: int = 0
+
+    @property
+    def start(self) -> int:
+        return self.ranges[0][0]
+
+    @property
+    def size(self) -> int:
+        return sum(end - start for start, end in self.ranges)
+
+
+class _Index:  # pylint: disable=too-few-public-methods
+    """Where each byte of a parent section went: `(plan, offset in its new section)`."""
+
+    def __init__(self, plans: list[_Plan]):
+        self.entries = []
+        for plan in plans:
+            base = 0
+            for start, end in plan.ranges:
+                self.entries.append((start, end, plan, base))
+                base += end - start
+        self.entries.sort(key=lambda e: e[0])
+        self.starts = [e[0] for e in self.entries]
+
+    def locate(self, off: int) -> tuple[_Plan, int] | None:
+        i = bisect.bisect_right(self.starts, off) - 1
+        if i >= 0:
+            start, end, plan, base = self.entries[i]
+            if off < end:
+                return plan, base + off - start
+        return None
 
 
 def _read(data: bytes) -> list[_Section] | None:
@@ -179,45 +218,41 @@ def split_data_objects(path: Path) -> int:
             for j in range(len(symtab.data) // 0x10)]
     names = [get_name(strtab, s[0]) if s[0] < len(strtab) else '' for s in syms]
 
-    objects = _choose(sections, syms, names)
-    objects += _add_pool_symbols(sections, syms, names, symtab.link)
-    if not objects:
+    plans = _choose(sections, syms, names)
+    plans += _plan_functions(sections, syms, names, symtab.link)
+    if not plans:
         return 0
 
-    # New data sections first, so their indices are known before the REL ones.
-    by_parent: dict[int, list[_Object]] = {}
-    first_new = len(sections)
-    for k, (shndx, sym_idx, sec_name, flags) in enumerate(objects):
-        start = syms[sym_idx][1]
-        obj = _Object(sym_idx, start, start + syms[sym_idx][2], first_new + k, sec_name, flags)
-        by_parent.setdefault(shndx, []).append(obj)
-    for objs in by_parent.values():
-        objs.sort(key=lambda o: o.start)
+    # New sections first, so their indices are known before the REL ones.
+    for k, plan in enumerate(plans):
+        plan.new_shndx = len(sections) + k
+    index = {shndx: _Index([p for p in plans if p.parent == shndx])
+             for shndx in {p.parent for p in plans}}
 
-    _repoint_section_relocs(sections, syms, by_parent)
+    _repoint_section_relocs(sections, syms, index)
+    inner = _inner_relocs(sections, index)
 
-    inner = _inner_relocs(sections, by_parent)
-
-    new_sections = []
-    for shndx, objs in by_parent.items():
-        parent = sections[shndx]
-        for obj in objs:
-            align = obj.start & -obj.start or parent.align
-            new_sections.append((obj.new_shndx, _Section(
-                obj.section, SectionHeaderType.SHT_PROGBITS, obj.flags, 0, 0,
-                min(align, max(parent.align, 1)), 0,
-                bytearray(parent.data[obj.start:obj.end]))))
-            syms[obj.sym_idx][1] = 0
-            syms[obj.sym_idx][5] = obj.new_shndx
-    new_sections.sort(key=lambda p: p[0])
-    sections.extend(sec for _, sec in new_sections)
+    for plan in plans:
+        parent = sections[plan.parent]
+        align = plan.start & -plan.start or parent.align
+        body = bytearray()
+        for start, end in plan.ranges:
+            body += parent.data[start:end]
+        sections.append(_Section(plan.section, SectionHeaderType.SHT_PROGBITS, plan.flags, 0, 0,
+                                 min(align, max(parent.align, 1)), 0, body))
+        for j in [plan.sym_idx, *plan.moves]:
+            where = index[plan.parent].locate(syms[j][1] & ~1)
+            offset = where[1] if where is not None else 0
+            syms[j][1] = offset | (syms[j][1] & 1)
+            syms[j][5] = plan.new_shndx
+        syms[plan.sym_idx][2] = plan.size
     for shndx in sorted(inner):
         sections.append(_Section('.rel' + sections[shndx].name, SectionHeaderType.SHT_REL,
                                  _SHF_INFO_LINK, symtab_idx, shndx, 4, 8, inner[shndx]))
 
     symtab.data = bytearray(b''.join(struct.pack('<IIIBBH', *s) for s in syms))
     _write(path, sections, shstrndx)
-    return len(objects)
+    return len(plans)
 
 
 def _name_counts(names: list[str]) -> dict[str, int]:
@@ -229,9 +264,8 @@ def _name_counts(names: list[str]) -> dict[str, int]:
 
 
 def _choose(sections: list[_Section], syms: list[list[int]],
-            names: list[str]) -> list[tuple[int, int, str, int]]:
-    """`(shndx, symbol index, new section, flags)` of every object worth a
-    section of its own."""
+            names: list[str]) -> list[_Plan]:
+    """A plan for every data object worth a section of its own."""
     counts = _name_counts(names)
     chosen = []
     for j, (_, value, size, info, _other, shndx) in enumerate(syms):
@@ -240,8 +274,8 @@ def _choose(sections: list[_Section], syms: list[list[int]],
         sec = sections[shndx]
         if (sec.name in SPLIT_FROM and sec.type == SectionHeaderType.SHT_PROGBITS
                 and counts.get(names[j]) == 1 and value + size <= len(sec.data)):
-            chosen.append((shndx, j, split_section_name(sec.name, names[j]),
-                           sec.flags & ~_SHF_MERGE_STRINGS))
+            chosen.append(_Plan(shndx, j, split_section_name(sec.name, names[j]),
+                                sec.flags & ~_SHF_MERGE_STRINGS, [(value, value + size)]))
     return chosen
 
 
@@ -250,70 +284,125 @@ def _is_mapping(name: str, kind: str) -> bool:
     return name == kind or name.startswith(kind + '.')
 
 
-def _add_pool_symbols(sections: list[_Section], syms: list[list[int]], names: list[str],
-                      strtab_idx: int) -> list[tuple[int, int, str, int]]:
-    """Give each function's trailing literal pool a symbol, and choose it.
+@dataclass
+class _Marks:
+    """A code section's mapping symbols and sized symbols, in address order."""
+    code: list[tuple[int, int]]   # (value, symbol index) of every $a/$t
+    data: list[int]               # value of every $d
+    sized: list[tuple[int, int]]  # (start, symbol index) of every sized symbol
 
-    armcc marks where data begins with a `$d` mapping symbol, so the pool is
-    read off the compiler's own output rather than worked out: it starts at
-    the first `$d` after the function's end and runs, across any further
-    `$d`, to the next `$a`/`$t`, the next sized symbol or the end of the
-    section. The target pairs the `$d` labels after the same function with it
-    (`_route_data` in objdiff.py). The new symbols are appended as globals, after every local,
-    as the symbol table requires.
-    """
-    counts = _name_counts(names)
-    code_marks: dict[int, list[int]] = {}
-    data_marks: dict[int, list[int]] = {}
-    sized: dict[int, list[tuple[int, int]]] = {}
+
+def _section_marks(sections: list[_Section], syms: list[list[int]],
+                   names: list[str]) -> dict[int, _Marks]:
+    marks: dict[int, _Marks] = {}
     for j, (_, value, size, info, _other, shndx) in enumerate(syms):
         if not 0 < shndx < len(sections):
             continue
+        entry = marks.setdefault(shndx, _Marks([], [], []))
         if _is_mapping(names[j], '$d'):
-            data_marks.setdefault(shndx, []).append(value)
+            entry.data.append(value)
         elif _is_mapping(names[j], '$a') or _is_mapping(names[j], '$t'):
-            code_marks.setdefault(shndx, []).append(value)
+            entry.code.append((value, j))
         elif size and info & 0xF in (_STT_FUNC, _STT_OBJECT):
-            sized.setdefault(shndx, []).append((value & ~1, j))
+            entry.sized.append((value & ~1, j))
+    for entry in marks.values():
+        entry.code.sort()
+        entry.data.sort()
+        entry.sized.sort()
+    return marks
 
+
+def _plan_functions(sections: list[_Section], syms: list[list[int]], names: list[str],
+                    strtab_idx: int) -> list[_Plan]:
+    """Separate each function's literal pools from its code.
+
+    armcc marks where data begins with a `$d` mapping symbol and where code
+    resumes with `$a`/`$t`, so every boundary is read off the compiler's own
+    output rather than worked out:
+
+    * A pool in the middle of a function runs from a `$d` inside it to the
+      next `$a`/`$t`. The function's code ranges go to `.text:<function>`,
+      laid end to end, with the function symbol and its code mapping symbols;
+      it is then exactly the function's instructions.
+    * The pool after a function starts at the first `$d` past its end and
+      runs, across any further `$d`, to the next `$a`/`$t`, the next sized
+      symbol or the end of the section -- armcc leaves it outside the symbol.
+    * Both kinds go to `.pool:<function>`, mid-function ones first, under a
+      new symbol `<function>$pool`, appended as a global after every local,
+      as the symbol table requires.
+
+    The target builds the same two sections from the CSV's mapping rows and
+    `$d` labels (objdiff.py), so the two compare as code and as data.
+    """
+    counts = _name_counts(names)
     strtab = sections[strtab_idx].data
-    chosen = []
-    for shndx, entries in sized.items():
+    plans = []
+    for shndx, marks in _section_marks(sections, syms, names).items():
         sec = sections[shndx]
         if not sec.flags & SectionHeaderFlags.SHF_EXECINSTR:
             continue
-        entries.sort()
-        bounds = sorted({*code_marks.get(shndx, []), *(e[0] for e in entries), len(sec.data)})
-        starts = sorted(data_marks.get(shndx, []))
-        for start, j in entries:
+        code_at = [v for v, _ in marks.code]
+        bounds = sorted({*code_at, *(e[0] for e in marks.sized), len(sec.data)})
+        for start, j in marks.sized:
             if syms[j][3] & 0xF != _STT_FUNC or counts.get(names[j]) != 1:
                 continue
             end = start + syms[j][2]
+            inner = _inner_pools(marks, start, end)
+            pools = list(inner)
             limit = next(b for b in bounds if b >= end)
-            pool = next((a for a in starts if end <= a < limit), None)
-            if pool is None:
+            trailing = next((a for a in marks.data if end <= a < limit), None)
+            if trailing is not None:
+                pools.append((trailing, next(b for b in bounds if b > trailing)))
+            if inner and start in code_at:
+                code = _complement(start, end, inner)
+                moves = [k for v, k in marks.code if any(a <= v < b for a, b in code)]
+                plans.append(_Plan(shndx, j, f'.text{_SEP}{names[j]}', sec.flags, code, moves))
+            elif inner:
+                continue  # no $a/$t to carry the mode over; leave the function whole
+            if not pools:
                 continue
-            pool_end = next(b for b in bounds if b > pool)
-            syms.append([len(strtab), pool, pool_end - pool, _GLOBAL_OBJECT, 0, shndx])
+            syms.append([len(strtab), pools[0][0], 0, _GLOBAL_OBJECT, 0, shndx])
             names.append(names[j] + '$pool')
             strtab += names[-1].encode('utf-8') + b'\x00'
-            chosen.append((shndx, len(syms) - 1, pool_section(names[j]),
-                           int(SectionHeaderFlags.SHF_ALLOC)))
-    return chosen
+            plans.append(_Plan(shndx, len(syms) - 1, pool_section(names[j]),
+                               int(SectionHeaderFlags.SHF_ALLOC), pools))
+    return plans
 
 
-def _inner_relocs(sections: list[_Section],
-                  by_parent: dict[int, list[_Object]]) -> dict[int, bytearray]:
-    """REL bodies for each new section: the entries inside its object, rebased."""
+def _inner_pools(marks: _Marks, start: int, end: int) -> list[tuple[int, int]]:
+    """`(start, end)` of each data run strictly inside a function."""
+    pools = []
+    for d in marks.data:
+        if not start < d < end or (pools and d < pools[-1][1]):
+            continue
+        resume = next((v for v, _ in marks.code if v > d), end)
+        pools.append((d, min(resume, end)))
+    return pools
+
+
+def _complement(start: int, end: int, holes: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out = []
+    cur = start
+    for a, b in holes:
+        if a > cur:
+            out.append((cur, a))
+        cur = max(cur, b)
+    if cur < end:
+        out.append((cur, end))
+    return out
+
+
+def _inner_relocs(sections: list[_Section], index: dict[int, _Index]) -> dict[int, bytearray]:
+    """REL bodies for each new section: the entries inside its ranges, rebased."""
     inner: dict[int, bytearray] = {}
     for rel in sections:
-        if rel.type != SectionHeaderType.SHT_REL or rel.info not in by_parent:
+        if rel.type != SectionHeaderType.SHT_REL or rel.info not in index:
             continue
         for off, info in _rel_entries(rel):
-            obj = _find(by_parent[rel.info], off)
-            if obj is not None and off + 4 <= obj.end:
-                inner.setdefault(obj.new_shndx, bytearray()).extend(
-                    struct.pack('<II', off - obj.start, info))
+            where = index[rel.info].locate(off)
+            if where is not None:
+                inner.setdefault(where[0].new_shndx, bytearray()).extend(
+                    struct.pack('<II', where[1], info))
     return inner
 
 
@@ -321,17 +410,8 @@ def _rel_entries(rel: _Section) -> list[tuple[int, int]]:
     return [struct.unpack_from('<II', rel.data, 8 * k) for k in range(len(rel.data) // 8)]
 
 
-def _find(objs: list[_Object], off: int) -> _Object | None:
-    for obj in objs:
-        if obj.start <= off < obj.end:
-            return obj
-        if obj.start > off:
-            break
-    return None
-
-
 def _repoint_section_relocs(sections: list[_Section], syms: list[list[int]],
-                            by_parent: dict[int, list[_Object]]):
+                            index: dict[int, _Index]):
     """Point `[.rodata]+N` references into a split object at the object itself.
 
     Only R_ARM_ABS32 is rewritten: it is how code and data take an object's
@@ -347,11 +427,10 @@ def _repoint_section_relocs(sections: list[_Section], syms: list[list[int]],
             if rtype != RelocationType.R_ARM_ABS32 or sym_idx >= len(syms):
                 continue
             sym = syms[sym_idx]
-            if sym[3] & 0xF != _STT_SECTION or sym[5] not in by_parent or off + 4 > len(target):
+            if sym[3] & 0xF != _STT_SECTION or sym[5] not in index or off + 4 > len(target):
                 continue
-            reach = sym[1] + struct.unpack_from('<i', target, off)[0]
-            obj = _find(by_parent[sym[5]], reach)
-            if obj is None:
+            where = index[sym[5]].locate(sym[1] + struct.unpack_from('<i', target, off)[0])
+            if where is None:
                 continue
-            struct.pack_into('<i', target, off, reach - obj.start)
-            struct.pack_into('<II', rel.data, 8 * k, off, (obj.sym_idx << 8) | rtype)
+            struct.pack_into('<i', target, off, where[1])
+            struct.pack_into('<II', rel.data, 8 * k, off, (where[0].sym_idx << 8) | rtype)
