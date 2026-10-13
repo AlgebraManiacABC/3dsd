@@ -225,6 +225,12 @@ class BaseObject:
                 return sym.name, target - sym.value
         return f'[{self.names[rel.sym.shndx]}]', rel.addend
 
+    def has_inner_data(self, sym: BaseSymbol) -> bool:
+        """Whether armcc marked data (`$d`) inside a function's extent."""
+        start = sym.value & ~1
+        return any(s.name == '$d' and start < s.value < start + sym.size
+                   for s in self._ordered.get(sym.shndx, []))
+
     def bytes_at(self, sym: BaseSymbol, offset: int, size: int) -> bytes | None:
         content = self.contents[sym.shndx]
         start = (sym.value & ~1) + offset
@@ -442,6 +448,8 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
         self.relocs: list[TargetReloc] = []
         self.unresolved = 0
         self.mapping: list[tuple[int, str]] = []
+        #: Functions whose data the CSV marks itself; no pools are inferred there.
+        self.marked: set[str] = set()
 
     def run(self, syms: list[Symbol]) -> tuple[bytes, list[TargetReloc]]:
         """Recover relocations for every target symbol with a twin in the base.
@@ -480,7 +488,8 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
         start, end = sym.addr, sym.addr + sym.size
         thumb = sym.mode == '$t'
         pools = (_thumb_pools if thumb else _arm_pools)(self.orig, start, end)
-        self._map_pools(pools, end, sym.mode)
+        if sym.name not in self.marked:
+            self._map_pools(pools, end, sym.mode)
         twin_relocs = self.base.relocs_in(twin)
         types = {r.rtype for r in twin_relocs.values()}
         if not types:

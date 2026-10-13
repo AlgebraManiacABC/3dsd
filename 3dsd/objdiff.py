@@ -1,5 +1,6 @@
 """objdiff integration: target ELFs, objdiff.json, the base link and progress."""
 
+import bisect
 import ctypes
 import itertools
 import json
@@ -8,6 +9,7 @@ import shutil
 import struct
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import ProjectConfig
@@ -211,7 +213,8 @@ def generate_target_elfs(config: ProjectConfig):
     for name, binary in config.binaries.items():
         data = binary.data
         decompiled = config.get_decompiled_data(name)
-        csv = config.symbols.get(name, [])
+        csv, marks = _place_markers(name, config.symbols.get(name, []),
+                                    config.markers.get(name, []), len(data), binary.base_addr)
         base_path = config.out_dir / 'objdiff_base' / name
         base = read_base(base_path.read_bytes()) if base_path.exists() else None
         split = split_sections_of(base.names) if base is not None else {}
@@ -221,13 +224,91 @@ def generate_target_elfs(config: ProjectConfig):
         syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
         _warn_unnamed(name, syms, binary.base_addr,
                       set(base.by_name) if base is not None else set())
-        data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms)
+        data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms, marks)
         out = target_dir / name
-        write_target_elf(out, data, syms, relocs, mapping)
+        write_target_elf(out, data, syms, relocs, marks.mapping + mapping)
         std_bytes = sum(s.size for s in syms if s.is_stdlib)
         labelled = len(syms) - sum(1 for s in syms if s.is_stdlib)
         note = f", {std_bytes:,} std bytes discounted" if std_bytes else ""
         print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note}{rel_note} -> {out}")
+
+
+@dataclass
+class _Markers:
+    """What a CSV's mapping rows contribute to the target."""
+    #: `(addr, '$a'|'$t'|'$d')` for every marker inside a symbol.
+    mapping: list[tuple[int, str]] = field(default_factory=list)
+    #: Functions with at least one marker inside them.
+    functions: set[str] = field(default_factory=set)
+
+
+def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylint: disable=too-many-locals
+                   bin_size: int, base_addr: int) -> tuple[list[Symbol], _Markers]:
+    """Sort a CSV's mapping rows into markers inside symbols and trailing pools.
+
+    A marker inside a symbol becomes a mapping symbol in the target, so a
+    mid-function pool decodes as `.word` rows, as armcc's own `$d` makes it on
+    the compiled side. A `$d` outside every symbol is data with no name --
+    typically the literal pool after a function, which armcc leaves outside
+    the function's symbol -- so it is returned as a `$d` symbol of its own
+    (`pool_<address>`), for `_route_data` to pair with the function before it.
+
+    A marker runs until the next one or the end of its symbol (or, outside
+    any, the next symbol); a Size that disagrees is reported, not followed.
+    """
+    out = _Markers()
+    extents = sorted((s.addr, s.addr + s.size, s.name) for s in csv
+                     if s.segment == '.text' and s.size > 0 and 0 <= s.addr < bin_size)
+    starts = [e[0] for e in extents]
+    all_starts = sorted(s.addr for s in csv if 0 <= s.addr < bin_size)
+    marks = sorted((m for m in markers if 0 <= m.addr < bin_size), key=lambda m: m.addr)
+    trailing = []
+    mismatched = []
+    for k, mark in enumerate(marks):
+        nxt = marks[k + 1].addr if k + 1 < len(marks) else bin_size
+        i = bisect.bisect_right(starts, mark.addr) - 1
+        if i >= 0 and mark.addr < extents[i][1]:
+            end = min(nxt, extents[i][1])
+            out.mapping.append((mark.addr, mark.mode))
+            out.functions.add(extents[i][2])
+        else:
+            j = bisect.bisect_right(all_starts, mark.addr)
+            end = min(nxt, all_starts[j] if j < len(all_starts) else bin_size)
+            if mark.mode == '$d':
+                trailing.append(Symbol(mark.addr, f'pool_{base_addr + mark.addr:08x}', '$d',
+                                       end - mark.addr, mark.segment, mark.namespace))
+        if mark.size and mark.size != end - mark.addr:
+            mismatched.append(f"{base_addr + mark.addr:08x} {mark.mode}: Size {mark.size:#x}, "
+                              f"runs {end - mark.addr:#x} to the next marker or symbol")
+    if mismatched:
+        print(f"  Warning: {name}: {len(mismatched):,} mapping row(s) whose Size disagrees "
+              f"with where they end; using the marker's extent:")
+        for line in mismatched[:5]:
+            print(f"    {line}")
+        if len(mismatched) > 5:
+            print(f"    ... and {len(mismatched) - 5:,} more")
+    return csv + trailing, out
+
+
+def _warn_unmarked(name: str, syms: list[Symbol], base: BaseObject, marked: set[str],
+                   base_addr: int):
+    """Report decompiled functions with data inside that the CSV does not mark.
+
+    armcc marks a mid-function literal pool with `$d`. Without the matching
+    mapping rows in the CSV, the target has to infer that pool from the
+    function's own pc-relative loads; only the CSV can say for certain.
+    """
+    missing = [s for s in syms if s.segment == '.text' and s.name not in marked
+               and (twin := base.twin(s.name, '.text')) is not None
+               and base.has_inner_data(twin)]
+    if not missing:
+        return
+    print(f"  Warning: {name}: {len(missing):,} decompiled function(s) hold data (a "
+          f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:")
+    for sym in missing[:5]:
+        print(f"    {base_addr + sym.addr:08x} {sym.name}")
+    if len(missing) > 5:
+        print(f"    ... and {len(missing) - 5:,} more")
 
 
 def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[str]):
@@ -265,8 +346,8 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
             print(f"      ... and {len(after_compiled) - 5:,} more")
 
 
-def _recover_relocs(base: BaseObject | None, binary: CTRBinary,
-                    csv: list[Symbol], syms: list[Symbol]):
+def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers"):
     """`(data, relocs, mapping, note)`: the target's bytes, relocations and
     literal-pool mapping symbols, recovered against its base."""
     if base is None:
@@ -275,7 +356,9 @@ def _recover_relocs(base: BaseObject | None, binary: CTRBinary,
     # addresses to look up; its branches are pc-relative and still resolve.
     recovery = RelocRecovery(binary.data, csv, base, binary.base_addr,
                              pointers=not isinstance(binary.binary, CRO))
+    recovery.marked = marks.functions
     data, relocs = recovery.run(syms)
+    _warn_unmarked(binary.name, syms, base, marks.functions, binary.base_addr)
     note = f", {len(relocs):,} relocations"
     if recovery.unresolved:
         note += f" ({recovery.unresolved:,} references reach no CSV symbol)"

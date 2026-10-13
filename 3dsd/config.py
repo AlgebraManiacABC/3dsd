@@ -94,6 +94,9 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
         self.out_dir = out_dir
         self.tool_dir = tool_dir
         self.symbols = symbols
+        # Mapping rows (`$a`/`$t`/`$d`) from the symbol CSVs, kept apart from
+        # the symbols: they mark what kind of bytes follow, they name nothing.
+        self.markers: dict[str, list[Symbol]] = {}
         self.cc_info = cc_info
         self.compilers = compilers or {}
         self.deps = deps or {}
@@ -142,27 +145,13 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
         sources = _gather_sources(source_dir, cc_info, single_binary)
         _add_dep_sources(sources, cc_info, deps, binaries, single_binary)
 
-        symbols: dict[str, list[Symbol]] = {}
-        for f in sym_dir.iterdir():
-            if not f.is_file():
-                continue
-            if single_binary and single_binary not in f.name:
-                continue
-            sym_list = _gather_symbols(f)
-            bin_name = f.stem
-            # Before the addresses go relative, so the reports quote the same
-            # addresses the CSV does.
-            _check_unique_names(f, sym_list)
-            if bin_name in binaries and binaries[bin_name].exheader:
-                _apply_exheader_segments(f, sym_list, binaries[bin_name])
-            if bin_name in binaries:
-                for sym in sym_list:
-                    sym.addr -= binaries[bin_name].base_addr
-            symbols[bin_name] = sym_list
+        symbols, markers = _load_symbols(sym_dir, binaries, single_binary)
 
-        return cls(working_dir, originals, exh, binaries, sources,
-                   build_dir, split_dir, link_dir, out_dir, tool_dir, symbols,
-                   cc_info, compilers, deps)
+        config = cls(working_dir, originals, exh, binaries, sources,
+                     build_dir, split_dir, link_dir, out_dir, tool_dir, symbols,
+                     cc_info, compilers, deps)
+        config.markers = markers
+        return config
 
     def src_key(self, binary_name: str, path: Path) -> str:
         """Identify a source by its path relative to `src/<binary>/`.
@@ -740,6 +729,44 @@ def _gather_binaries(path: Path, module: str | None = None
     if code_path:
         binaries[code_path.name] = CTRBinary(code_path.name, code_path.read_bytes(), exh)
     return exh, binaries
+
+
+def _load_symbols(sym_dir: Path, binaries: dict[str, CTRBinary], single_binary: str | None
+                  ) -> tuple[dict[str, list[Symbol]], dict[str, list[Symbol]]]:
+    """`(symbols, markers)` per binary from `symbols/`, addresses made relative."""
+    symbols: dict[str, list[Symbol]] = {}
+    markers: dict[str, list[Symbol]] = {}
+    for f in sym_dir.iterdir():
+        if not f.is_file():
+            continue
+        if single_binary and single_binary not in f.name:
+            continue
+        sym_list = _gather_symbols(f)
+        marks = [s for s in sym_list if is_marker(s.name)]
+        sym_list = [s for s in sym_list if not is_marker(s.name)]
+        bin_name = f.stem
+        # Before the addresses go relative, so the reports quote the same
+        # addresses the CSV does.
+        _check_unique_names(f, sym_list)
+        if bin_name in binaries and binaries[bin_name].exheader:
+            _apply_exheader_segments(f, sym_list, binaries[bin_name])
+        if bin_name in binaries:
+            for sym in sym_list + marks:
+                sym.addr -= binaries[bin_name].base_addr
+        symbols[bin_name] = sym_list
+        markers[bin_name] = marks
+    return symbols, markers
+
+
+def is_marker(name: str) -> bool:
+    """Whether a CSV row is a mapping row rather than a symbol.
+
+    A row named `$a`, `$t` or `$d` -- as ELF names its mapping symbols --
+    marks where ARM code, Thumb code or data begins, typically a literal pool
+    in the middle of a function and the code after it. It runs until the next
+    marker or the end of the symbol it sits in; its Size is only a cross-check.
+    """
+    return name in ('$a', '$t', '$d')
 
 
 def _gather_symbols(sym_path: Path) -> list[Symbol]:

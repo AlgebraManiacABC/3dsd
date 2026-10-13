@@ -70,6 +70,29 @@ the pool is compared with the one armcc emitted (cut at armcc's own `$d`
 mapping symbols), so a wrong constant or address shows in the data figures.
 Any other `$d` label goes with the undecompiled data.
 
+Rows named exactly `$a`, `$t` or `$d` are **mapping rows**, as ELF names its
+mapping symbols: they name nothing, they mark what kind of bytes begin there.
+A function row runs from its entry to its last instruction, exactly as
+armcc's own symbol does, and mapping rows inside it mark its mid-function
+literal pools and the code after them:
+
+```
+"00101000","foo","Global",$t,00000058,".text"   <- foo, entry to last instruction
+"00101020","$d","Global",$d,00000008,".text"    <- a pool inside foo
+"00101028","$t","Global",$t,00000030,".text"    <- foo's code resumes
+"00101058","$d","Global",$d,00000008,".text"    <- foo's trailing pool, outside it
+```
+
+A mapping row runs until the next one or the end of the symbol it sits in;
+its Size is only checked against that, and a disagreement is reported.
+Inside a function, the rows become mapping symbols in the objdiff target, so
+the pool is compared as `.word` rows against armcc's, not decoded as
+instructions. A `$d` row outside every symbol is unnamed data: right after a
+decompiled function it is that function's trailing pool, as above. Mapping
+rows are exempt from the unique-name check. A decompiled function whose
+compiled version holds data the CSV does not mark is reported; until it is
+marked, its pools are inferred from its own pc-relative loads.
+
 Put the title's `exheader.bin` in `orig/` too. It records where `code.bin`'s
 `.text`, `.rodata` and `.data` really begin and end, and when it is present
 each symbol's segment is taken from its address rather than the `Segment`
