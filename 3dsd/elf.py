@@ -250,16 +250,35 @@ _SHF_INFO_LINK = 0x40
 
 
 class _TargetLayout:
-    """Where each run of the binary lands: section index and offset within it."""
+    """Where each run of the binary lands: section index and offset within it.
+
+    The runs of one name are laid back to back, but never at an offset that
+    differs from their address modulo 4. Taking a run out of a section -- a
+    pool routed to data, an odd-sized `$d` label -- would otherwise shift
+    every following function off its alignment, and objdiff reads bit 0 of a
+    function's address as its Thumb bit: an ARM function at an odd offset is
+    decoded from one byte too early and matches nothing. The bytes skipped to
+    restore alignment are zero and belong to no symbol.
+
+    Split sections (`.text:Func`, `.pool:Func`, `.rodata:gTable`) are the
+    exception: the base lays their pieces end to end without padding, so the
+    target must too, or the two would differ by the padding.
+    """
 
     def __init__(self, runs: list[tuple[str, int, int]], sec_names: list[str]):
         self.starts = []
         self.places = []
+        self.runs: dict[str, list[tuple[int, int, int]]] = {n: [] for n in sec_names}
         offsets = dict.fromkeys(sec_names, 0)
         for name, start, end in runs:
+            off = offsets[name]
+            if ':' not in name:
+                off += (start - off) % 4
             self.starts.append(start)
-            self.places.append((sec_names.index(name) + 1, offsets[name] - start))
-            offsets[name] += end - start
+            self.places.append((sec_names.index(name) + 1, off - start))
+            self.runs[name].append((start, end, off))
+            offsets[name] = off + end - start
+        self.sizes = offsets
 
     def place(self, addr: int) -> tuple[int, int]:
         """`(shndx, section offset)` of a binary offset."""
@@ -369,7 +388,7 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
 
     local_syms, global_syms, strtab_bytes, sym_index = _target_symtab(
         sym_list, layout, sec_names, relocs, mapping or [],
-        {n: sum(e - s for s, e in merged[n]) for n in sec_names})
+        layout.sizes)
 
     rel_entries = _rel_entries(relocs, layout, sym_index)
     rel_secs = sorted(rel_entries)
@@ -377,16 +396,16 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     writer = BinaryWriter()
     ELFHeader(0, 0, 0, True).write(writer)
 
-    # Section data: every run of a name, back to back, one section per name.
+    # Section data: every run of a name, at the offset the layout gave it.
     sec_offsets = []
     sec_sizes = []
     for name in sec_names:
-        sec_offsets.append(writer.tell())
-        size = 0
-        for start, end in merged[name]:
+        base = writer.tell()
+        sec_offsets.append(base)
+        for start, end, off in layout.runs[name]:
+            writer.write_bytes(b'\x00' * (base + off - writer.tell()))
             writer.write_bytes(data[start:end])
-            size += end - start
-        sec_sizes.append(size)
+        sec_sizes.append(layout.sizes[name])
         pad_to_4(writer)
 
     # Symtab
