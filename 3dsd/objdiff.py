@@ -261,40 +261,58 @@ def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylin
     (`pool_<address>`), for `_route_data` to pair with the function before it.
 
     A marker runs until the next one or the end of its symbol (or, outside
-    any, the next symbol); a Size that disagrees is reported, not followed.
+    any, the next symbol). A `$d` whose Size ends sooner ends there, and the
+    unnamed bytes after it are taken for code, never as more of the pool. A
+    Size that runs past the next marker or symbol is reported and cut short.
     """
     out = _Markers()
     extents = sorted((s.addr, s.addr + s.size, s.name) for s in csv
                      if s.segment == '.text' and s.size > 0 and 0 <= s.addr < bin_size)
+    modes = {s.name: s.mode for s in csv if s.segment == '.text'}
     starts = [e[0] for e in extents]
     all_starts = sorted(s.addr for s in csv if 0 <= s.addr < bin_size)
     marks = sorted((m for m in markers if 0 <= m.addr < bin_size), key=lambda m: m.addr)
     trailing = []
-    mismatched = []
+    overruns = []
+    code_mode: dict[str, str] = {}   # the mode a function's code is in, so far
     for k, mark in enumerate(marks):
         nxt = marks[k + 1].addr if k + 1 < len(marks) else bin_size
         i = bisect.bisect_right(starts, mark.addr) - 1
-        if i >= 0 and mark.addr < extents[i][1]:
-            end = min(nxt, extents[i][1])
-            out.mapping.append((mark.addr, mark.mode))
-            out.functions.add(extents[i][2])
-            out.inner.setdefault(extents[i][2], []).append((mark.addr, end, mark.mode))
+        inside = i >= 0 and mark.addr < extents[i][1]
+        if inside:
+            limit = min(nxt, extents[i][1])
         else:
             j = bisect.bisect_right(all_starts, mark.addr)
-            end = min(nxt, all_starts[j] if j < len(all_starts) else bin_size)
-            if mark.mode == '$d':
-                trailing.append(Symbol(mark.addr, f'pool_{base_addr + mark.addr:08x}', '$d',
-                                       end - mark.addr, mark.segment, mark.namespace))
-        if mark.size and mark.size != end - mark.addr:
-            mismatched.append(f"{base_addr + mark.addr:08x} {mark.mode}: Size {mark.size:#x}, "
-                              f"runs {end - mark.addr:#x} to the next marker or symbol")
-    if mismatched:
-        print(f"  Warning: {name}: {len(mismatched):,} mapping row(s) whose Size disagrees "
-              f"with where they end; using the marker's extent:")
-        for line in mismatched[:5]:
+            limit = min(nxt, all_starts[j] if j < len(all_starts) else bin_size)
+        end = limit
+        if mark.size and mark.size > limit - mark.addr:
+            overruns.append(f"{base_addr + mark.addr:08x} {mark.mode}: Size {mark.size:#x}, "
+                            f"but the next marker or symbol is {limit - mark.addr:#x} away")
+        elif mark.size and mark.mode == '$d':
+            # Data ends where the CSV says it does. What follows, unnamed, is
+            # taken for code -- a pool is never stretched over it.
+            end = mark.addr + mark.size
+        if inside:
+            func = extents[i][2]
+            out.mapping.append((mark.addr, mark.mode))
+            out.functions.add(func)
+            out.inner.setdefault(func, []).append((mark.addr, end, mark.mode))
+            if mark.mode != '$d':
+                code_mode[func] = mark.mode
+            elif end < limit:
+                resume = code_mode.get(func, modes.get(func, '$a'))
+                out.mapping.append((end, resume))
+                out.inner[func].append((end, limit, resume))
+        elif mark.mode == '$d':
+            trailing.append(Symbol(mark.addr, f'pool_{base_addr + mark.addr:08x}', '$d',
+                                   end - mark.addr, mark.segment, mark.namespace))
+    if overruns:
+        print(f"  Warning: {name}: {len(overruns):,} mapping row(s) whose Size runs past the "
+              f"next marker or symbol; cut short there:")
+        for line in overruns[:5]:
             print(f"    {line}")
-        if len(mismatched) > 5:
-            print(f"    ... and {len(mismatched) - 5:,} more")
+        if len(overruns) > 5:
+            print(f"    ... and {len(overruns) - 5:,} more")
     return csv + trailing, out
 
 
