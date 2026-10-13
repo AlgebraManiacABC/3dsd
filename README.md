@@ -84,14 +84,19 @@ literal pools and the code after them:
 ```
 
 A mapping row runs until the next one or the end of the symbol it sits in;
-its Size is only checked against that, and a disagreement is reported.
-Inside a function, the rows become mapping symbols in the objdiff target, so
-the pool is compared as `.word` rows against armcc's, not decoded as
-instructions. A `$d` row outside every symbol is unnamed data: right after a
-decompiled function it is that function's trailing pool, as above. Mapping
-rows are exempt from the unique-name check. A decompiled function whose
-compiled version holds data the CSV does not mark is reported; until it is
-marked, its pools are inferred from its own pc-relative loads.
+its Size is only checked against that, and a disagreement is reported. A `$d`
+row outside every symbol is unnamed data: right after a decompiled function
+it is that function's trailing pool, as above. Mapping rows are exempt from
+the unique-name check.
+
+Pools are data wherever they sit. A decompiled function whose pools are
+marked is cut in two on both sides: its code ranges, laid end to end, become
+`.text:<function>`, compared instruction for instruction, and its pools --
+the ones in its middle and the one after it -- become `.pool:<function>`,
+compared word for word. The compiled side is cut at armcc's own mapping
+symbols. A decompiled function whose compiled version holds a pool the CSV
+does not mark is reported, and is compared whole -- pool words and all --
+until the rows are added, so it cannot reach 100% before then.
 
 Put the title's `exheader.bin` in `orig/` too. It records where `code.bin`'s
 `.text`, `.rodata` and `.data` really begin and end, and when it is present

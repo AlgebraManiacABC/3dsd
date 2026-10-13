@@ -267,9 +267,9 @@ class _TargetLayout:
         return shndx, addr + delta
 
 
-def _target_symtab(sym_list: list[Symbol], layout: _TargetLayout,  # pylint: disable=too-many-locals
+def _target_symtab(sym_list: list[Symbol], layout: _TargetLayout,  # pylint: disable=too-many-locals,too-many-arguments,too-many-positional-arguments
                    sec_names: list[str], relocs: list[TargetReloc],
-                   mapping: list[tuple[int, str]]):
+                   mapping: list[tuple[int, str]], section_sizes: dict[str, int]):
     """Build `(local_syms, global_syms, strtab, symbol_index)` for `write_target_elf`.
 
     `symbol_index` maps each name a relocation refers to to its index in the
@@ -284,14 +284,17 @@ def _target_symtab(sym_list: list[Symbol], layout: _TargetLayout,  # pylint: dis
     global_names = []
     for sym in sym_list:
         shndx, sym_value = layout.place(sym.addr)
-        is_code = sec_names[shndx - 1] == '.text'
+        section = sec_names[shndx - 1]
+        is_code = section.partition(':')[0] == '.text'
         thumb = 1 if is_code and sym.mode == '$t' else 0
         sym_type = 0x12 if is_code else 0x11  # STT_FUNC / STT_OBJECT
         local_syms.append(SymbolTableEntry(len(local_strtab), sym_value, 0, 0x0, 0x0, shndx))
         local_strtab += sym.mode.encode('utf-8') + b'\x00'
-        if sym.is_stdlib:
-            continue  # library code: leave these bytes unlabelled
-        global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, sym.size,
+        if sym.is_stdlib or not sym.name:
+            continue  # library code, or a later piece of a cut function: unlabelled
+        # A function cut into pieces ('.text:Func') spans its whole section.
+        size = section_sizes[section] if section.startswith('.text:') else sym.size
+        global_syms.append(SymbolTableEntry(len(global_strtab), sym_value | thumb, size,
                                             sym_type, 0, shndx))
         global_names.append(sym.name)
         global_strtab += sym.name.encode('utf-8') + b'\x00'
@@ -365,7 +368,8 @@ def write_target_elf(out_path: Path, data: bytes,  # pylint: disable=too-many-lo
     layout = _TargetLayout(runs, sec_names)
 
     local_syms, global_syms, strtab_bytes, sym_index = _target_symtab(
-        sym_list, layout, sec_names, relocs, mapping or [])
+        sym_list, layout, sec_names, relocs, mapping or [],
+        {n: sum(e - s for s, e in merged[n]) for n in sec_names})
 
     rel_entries = _rel_entries(relocs, layout, sym_index)
     rel_secs = sorted(rel_entries)

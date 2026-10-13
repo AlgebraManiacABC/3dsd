@@ -224,6 +224,11 @@ def generate_target_elfs(config: ProjectConfig):
         syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
         _warn_unnamed(name, syms, binary.base_addr,
                       set(base.by_name) if base is not None else set())
+        if base is not None:
+            syms, cut = _cut_pools(syms, marks, set(base.names))
+            # A cut function's markers are spent: its pieces are its sections.
+            marks.mapping = [m for m in marks.mapping
+                             if not any(a <= m[0] < b for a, b in cut)]
         data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms, marks)
         out = target_dir / name
         write_target_elf(out, data, syms, relocs, marks.mapping + mapping)
@@ -240,6 +245,8 @@ class _Markers:
     mapping: list[tuple[int, str]] = field(default_factory=list)
     #: Functions with at least one marker inside them.
     functions: set[str] = field(default_factory=set)
+    #: `{function: [(start, end, mode)]}`: the extent of each marker inside it.
+    inner: dict[str, list[tuple[int, int, str]]] = field(default_factory=dict)
 
 
 def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylint: disable=too-many-locals
@@ -271,6 +278,7 @@ def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylin
             end = min(nxt, extents[i][1])
             out.mapping.append((mark.addr, mark.mode))
             out.functions.add(extents[i][2])
+            out.inner.setdefault(extents[i][2], []).append((mark.addr, end, mark.mode))
         else:
             j = bisect.bisect_right(all_starts, mark.addr)
             end = min(nxt, all_starts[j] if j < len(all_starts) else bin_size)
@@ -290,6 +298,60 @@ def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylin
     return csv + trailing, out
 
 
+def _cut_pools(syms: list[Symbol], marks: _Markers,
+               base_sections: set[str]) -> tuple[list[Symbol], list[tuple[int, int]]]:
+    """Cut the literal pools out of the middle of each decompiled function.
+
+    A pool inside a function is data, as one after it is, so it is measured
+    as data: the function's code ranges go to `.text:<function>`, laid end to
+    end, and its pools join its trailing pool in `.pool:<function>`. The base
+    does the same from armcc's own mapping symbols (datasplit.py), so the
+    function then compares instruction for instruction and the pools word
+    for word. The boundaries are the CSV's mapping rows; a function the base
+    did not cut stays whole.
+
+    Only the first code piece carries the function's name; the writer gives
+    it the size of all of them. Returns the symbols and the extent of every
+    function cut.
+    """
+    out = []
+    cut = []
+    for sym in syms:
+        runs = marks.inner.get(sym.name) if sym.segment == '.text' else None
+        code_section = f'.text:{sym.name}'
+        if sym.segment != '.text' or code_section not in base_sections:
+            out.append(sym)
+            continue
+        if not runs or not any(mode == '$d' for _, _, mode in runs):
+            # armcc's version has pools inside but the CSV marks none: kept
+            # whole, it still pairs (and is reported) until the rows are added.
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size, code_section,
+                              sym.namespace))
+            continue
+        cuts = sorted(runs)
+        pieces = []
+        cur, mode = sym.addr, sym.mode
+        for start, end, kind in cuts:
+            if start > cur:
+                pieces.append((cur, start - cur, mode, code_section))
+            if kind == '$d':
+                pieces.append((start, end - start, '$d', pool_section(sym.name)))
+            else:
+                pieces.append((start, end - start, kind, code_section))
+                mode = kind
+            cur = max(cur, end)
+        if cur < sym.addr + sym.size:
+            pieces.append((cur, sym.addr + sym.size - cur, mode, code_section))
+        cut.append((sym.addr, sym.addr + sym.size))
+        named = False
+        for addr, size, kind, section in pieces:
+            name = ''
+            if section == code_section and not named:
+                name, named = sym.name, True
+            out.append(Symbol(addr, name, kind, size, section, sym.namespace))
+    return out, cut
+
+
 def _warn_unmarked(name: str, syms: list[Symbol], base: BaseObject, marked: set[str],
                    base_addr: int):
     """Report decompiled functions with data inside that the CSV does not mark.
@@ -298,9 +360,11 @@ def _warn_unmarked(name: str, syms: list[Symbol], base: BaseObject, marked: set[
     mapping rows in the CSV, the target has to infer that pool from the
     function's own pc-relative loads; only the CSV can say for certain.
     """
-    missing = [s for s in syms if s.segment == '.text' and s.name not in marked
-               and (twin := base.twin(s.name, '.text')) is not None
-               and base.has_inner_data(twin)]
+    cut = {n.partition(':')[2] for n in base.names if n.startswith('.text:')}
+    missing = [s for s in syms if s.segment.partition(':')[0] == '.text' and s.name
+               and s.name not in marked
+               and (s.name in cut or ((twin := base.twin(s.name, '.text')) is not None
+                                      and base.has_inner_data(twin)))]
     if not missing:
         return
     print(f"  Warning: {name}: {len(missing):,} decompiled function(s) hold data (a "

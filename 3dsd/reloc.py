@@ -430,6 +430,38 @@ class _CsvIndex:
         return best
 
 
+class _PieceMap:
+    """The target pieces of one split section, laid end to end as the base has them."""
+
+    def __init__(self, parts: list[Symbol]):
+        self.pieces = []
+        base = 0
+        for part in sorted(parts, key=lambda p: p.addr):
+            self.pieces.append((part.addr, part.size, base))
+            base += part.size
+        self.starts = [p[0] for p in self.pieces]
+        self.bases = [p[2] for p in self.pieces]
+
+    def extent(self) -> tuple[int, int]:
+        """From the first piece's start to the last piece's end, in the binary."""
+        last = self.pieces[-1]
+        return self.pieces[0][0], last[0] + last[1]
+
+    def to_compact(self, addr: int) -> int | None:
+        """A binary offset's offset within the section, or None if not in it."""
+        i = bisect.bisect_right(self.starts, addr) - 1
+        if i >= 0 and addr < self.pieces[i][0] + self.pieces[i][1]:
+            return self.pieces[i][2] + addr - self.pieces[i][0]
+        return None
+
+    def to_orig(self, off: int) -> int | None:
+        """An offset within the section's binary offset."""
+        i = bisect.bisect_right(self.bases, off) - 1
+        if i >= 0 and off < self.pieces[i][2] + self.pieces[i][1]:
+            return self.pieces[i][0] + off - self.pieces[i][2]
+        return None
+
+
 class RelocRecovery:  # pylint: disable=too-few-public-methods
     """Recovers one binary's target relocations against its base ELF."""
 
@@ -459,15 +491,17 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
         symbol per function, so without these a pool decodes as instructions,
         and in Thumb a relocated pool word then straddles two of them.
         """
-        # A split section ('.pool:Func', '.rodata:gTable') is one object in the
-        # base but may be several labels in the target -- a pool the CSV marks
-        # word by word -- so it is handled whole, from its first byte.
+        # A split section ('.pool:Func', '.rodata:gTable', '.text:Func') is one
+        # object in the base, its bytes laid end to end, but may be several
+        # pieces in the target: a pool the CSV marks word by word, the pools cut
+        # out of a function's middle, the code around them. So it is handled
+        # whole, with offsets counted across its pieces, gaps included.
         split: dict[str, list[Symbol]] = {}
         for sym in syms:
-            if sym.is_stdlib or sym.name.startswith('pad_'):
-                continue
             if ':' in sym.segment:
                 split.setdefault(sym.segment, []).append(sym)
+                continue
+            if sym.is_stdlib or sym.name.startswith('pad_'):
                 continue
             twin = self.base.twin(sym.name, sym.segment)
             if twin is None:
@@ -477,21 +511,39 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
             else:
                 self._data(sym, twin)
         for segment, parts in split.items():
-            twin = self.base.twin(parts[0].name, segment)
-            if twin is not None:
-                start = min(p.addr for p in parts)
-                end = max(p.addr + p.size for p in parts)
-                self._data(Symbol(start, parts[0].name, '$d', end - start, segment), twin)
+            named = [p for p in parts if p.name and not p.name.startswith('pad_')]
+            first = named[0] if named else parts[0]
+            twin = self.base.twin(first.name, segment)
+            if twin is None:
+                continue
+            pieces = _PieceMap(parts)
+            if segment.partition(':')[0] == '.text':
+                self._function(first, twin, pieces)
+            else:
+                self._data(first, twin, pieces)
         return bytes(self.data), self.relocs
 
-    def _function(self, sym: Symbol, twin: BaseSymbol):
-        start, end = sym.addr, sym.addr + sym.size
+    def _function(self, sym: Symbol, twin: BaseSymbol, pieces: '_PieceMap | None' = None):
+        """Branches and pool loads in a decompiled function.
+
+        With `pieces` the function has had its pools cut out: offsets in the
+        twin count its code alone, and the pool words, which the twin keeps in
+        `.pool:<function>`, are left to that section.
+        """
         thumb = sym.mode == '$t'
-        pools = (_thumb_pools if thumb else _arm_pools)(self.orig, start, end)
-        if sym.name not in self.marked:
-            self._map_pools(pools, end, sym.mode)
+        if pieces is None:
+            start, end = sym.addr, sym.addr + sym.size
+            pools = (_thumb_pools if thumb else _arm_pools)(self.orig, start, end)
+            if sym.name not in self.marked:
+                self._map_pools(pools, end, sym.mode)
+        else:
+            start, end = pieces.extent()
+            pools = {a for a in range(start, end - 3, 4)
+                     if pieces.to_compact(a) is None}
         twin_relocs = self.base.relocs_in(twin)
         types = {r.rtype for r in twin_relocs.values()}
+        if pieces is not None:
+            types.discard(RelocationType.R_ARM_ABS32)
         if not types:
             return
         scan = _scan_thumb if thumb else _scan_arm
@@ -507,7 +559,9 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
 
         unused = dict(twin_relocs)
         for cand in cands:
-            rel = cand.off - start
+            rel = cand.off - start if pieces is None else pieces.to_compact(cand.off)
+            if rel is None:
+                continue
             partner = twin_relocs.get(rel)
             if partner is not None and not _same_class(partner.rtype, cand.rtype):
                 partner = None
@@ -528,12 +582,19 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
             if addr + 4 not in pools and addr + 4 < end:
                 self.mapping.append((addr + 4, mode))
 
-    def _data(self, sym: Symbol, twin: BaseSymbol):
+    def _data(self, sym: Symbol, twin: BaseSymbol, pieces: '_PieceMap | None' = None):
         """Pointers in a decompiled data object, at the offsets the twin has them."""
         for rel, partner in self.base.relocs_in(twin).items():
-            if partner.rtype != RelocationType.R_ARM_ABS32 or rel + 4 > sym.size:
+            if partner.rtype != RelocationType.R_ARM_ABS32:
                 continue
-            off = sym.addr + rel
+            if pieces is None:
+                off = sym.addr + rel if rel + 4 <= sym.size else None
+            else:
+                off = pieces.to_orig(rel)
+                if off is not None and pieces.to_orig(rel + 3) != off + 3:
+                    off = None  # the word straddles two pieces
+            if off is None:
+                continue
             value = struct.unpack_from('<I', self.orig, off)[0]
             self._emit(_Candidate(off, 4, partner.rtype, value - self.base_addr),
                        partner, {rel: partner})
