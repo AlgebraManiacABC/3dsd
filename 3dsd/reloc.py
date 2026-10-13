@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from .elf import ELFHeader, SectionHeaderType, TargetReloc
 from .util import BinaryReader, RelocationType, Symbol, get_name
 
+_STT_FUNC = 2
 _STT_SECTION = 3
 _SHN_LORESERVE = 0xFF00
 
@@ -120,6 +121,13 @@ class BaseSymbol:
     kind: int
     shndx: int
 
+    @property
+    def start(self) -> int:
+        """Offset of the first byte. Bit 0 of a function's value is its Thumb
+        bit, not its address; an object's value is all address -- a string
+        merged into the tail of another can start on an odd byte."""
+        return self.value & ~1 if self.kind == _STT_FUNC else self.value
+
 
 @dataclass(frozen=True)
 class BaseReloc:
@@ -158,7 +166,7 @@ class BaseObject:
             if sym.size:
                 self._named.setdefault(sym.shndx, []).append(sym)
         for entries in self._named.values():
-            entries.sort(key=lambda s: s.value & ~1)
+            entries.sort(key=lambda s: s.start)
         for entries in self._ordered.values():
             entries.sort(key=lambda s: (s.value, s.size))
 
@@ -177,7 +185,7 @@ class BaseObject:
 
     def relocs_in(self, sym: BaseSymbol) -> dict[int, BaseReloc]:
         """The relocations inside `sym`, keyed by offset from its start."""
-        start = sym.value & ~1
+        start = sym.start
         rels = self.relocs.get(sym.shndx, [])
         lo = bisect.bisect_left(rels, start, key=lambda r: r.offset)
         out = {}
@@ -190,10 +198,10 @@ class BaseObject:
     def named_at(self, shndx: int, offset: int) -> tuple[BaseSymbol, int] | None:
         """The named symbol covering `offset` in a section, and the offset into it."""
         entries = self._named.get(shndx, [])
-        i = bisect.bisect_right(entries, offset, key=lambda s: s.value & ~1) - 1
+        i = bisect.bisect_right(entries, offset, key=lambda s: s.start) - 1
         if i >= 0:
             sym = entries[i]
-            start = sym.value & ~1
+            start = sym.start
             if start <= offset < start + sym.size:
                 return sym, offset - start
         return None
@@ -227,13 +235,13 @@ class BaseObject:
 
     def has_inner_data(self, sym: BaseSymbol) -> bool:
         """Whether armcc marked data (`$d`) inside a function's extent."""
-        start = sym.value & ~1
+        start = sym.start
         return any(s.name == '$d' and start < s.value < start + sym.size
                    for s in self._ordered.get(sym.shndx, []))
 
     def bytes_at(self, sym: BaseSymbol, offset: int, size: int) -> bytes | None:
         content = self.contents[sym.shndx]
-        start = (sym.value & ~1) + offset
+        start = sym.start + offset
         if content is None or start + size > len(content):
             return None
         return content[start:start + size]

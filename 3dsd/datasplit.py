@@ -117,6 +117,15 @@ class _Plan:  # pylint: disable=too-many-instance-attributes
     def size(self) -> int:
         return sum(end - start for start, end in self.ranges)
 
+    def offset_of(self, addr: int) -> int:
+        """Where a byte of the parent lands in this plan's section."""
+        base = 0
+        for start, end in self.ranges:
+            if start <= addr < end:
+                return base + addr - start
+            base += end - start
+        return 0
+
 
 class _Index:  # pylint: disable=too-few-public-methods
     """Where each byte of a parent section went: `(plan, offset in its new section)`."""
@@ -130,6 +139,18 @@ class _Index:  # pylint: disable=too-few-public-methods
                 base += end - start
         self.entries.sort(key=lambda e: e[0])
         self.starts = [e[0] for e in self.entries]
+        # Whether any range lies inside another (a string merged into the tail
+        # of a longer one); only then can a byte belong to more than one plan.
+        self.nested = any(self.entries[k + 1][0] < self.entries[k][1]
+                          for k in range(len(self.entries) - 1))
+
+    def locate_all(self, off: int) -> list[tuple[_Plan, int]]:
+        """Every plan holding the byte at `off`, with its offset in each."""
+        if not self.nested:
+            where = self.locate(off)
+            return [where] if where is not None else []
+        return [(plan, base + off - start) for start, end, plan, base in self.entries
+                if start <= off < end]
 
     def locate(self, off: int) -> tuple[_Plan, int] | None:
         i = bisect.bisect_right(self.starts, off) - 1
@@ -160,14 +181,28 @@ def _read(data: bytes) -> list[_Section] | None:
 
 
 def _write(path: Path, sections: list[_Section], shstrndx: int):
-    """Lay the sections out afresh, names and all, and write the file."""
-    shstr = bytearray(b'\x00')
+    """Lay the sections out afresh, names and all, and write the file.
+
+    Section names are appended to the existing string table, never rewritten:
+    some assemblers keep symbol names in the same table, at offsets the
+    symbol table still points to.
+    """
+    shstr = sections[shstrndx].data
+    known: dict[str, int] = {}
     name_offs = []
     for sec in sections:
-        name_offs.append(len(shstr) if sec.name else 0)
-        if sec.name:
-            shstr += sec.name.encode('utf-8') + b'\x00'
-    sections[shstrndx].data = shstr
+        if not sec.name:
+            name_offs.append(0)
+            continue
+        if sec.name not in known:
+            encoded = sec.name.encode('utf-8') + b'\x00'
+            at = shstr.find(b'\x00' + encoded)
+            if at < 0:
+                known[sec.name] = len(shstr)
+                shstr += encoded
+            else:
+                known[sec.name] = at + 1
+        name_offs.append(known[sec.name])
 
     out = bytearray(ELFHeader.EHSIZE)
     offsets = []
@@ -241,9 +276,11 @@ def split_data_objects(path: Path) -> int:
         sections.append(_Section(plan.section, SectionHeaderType.SHT_PROGBITS, plan.flags, 0, 0,
                                  min(align, max(parent.align, 1)), 0, body))
         for j in [plan.sym_idx, *plan.moves]:
-            where = index[plan.parent].locate(syms[j][1] & ~1)
-            offset = where[1] if where is not None else 0
-            syms[j][1] = offset | (syms[j][1] & 1)
+            # Measured within this plan's own ranges: an object can lie inside
+            # another's (a string merged into the tail of a longer one), and
+            # the other's offset would then be the wrong one.
+            thumb = syms[j][1] & 1 if syms[j][3] & 0xF == _STT_FUNC else 0
+            syms[j][1] = plan.offset_of(syms[j][1] - thumb) | thumb
             syms[j][5] = plan.new_shndx
         syms[plan.sym_idx][2] = plan.size
     for shndx in sorted(inner):
@@ -304,7 +341,7 @@ def _section_marks(sections: list[_Section], syms: list[list[int]],
         elif _is_mapping(names[j], '$a') or _is_mapping(names[j], '$t'):
             entry.code.append((value, j))
         elif size and info & 0xF in (_STT_FUNC, _STT_OBJECT):
-            entry.sized.append((value & ~1, j))
+            entry.sized.append((value & ~1 if info & 0xF == _STT_FUNC else value, j))
     for entry in marks.values():
         entry.code.sort()
         entry.data.sort()
@@ -399,10 +436,9 @@ def _inner_relocs(sections: list[_Section], index: dict[int, _Index]) -> dict[in
         if rel.type != SectionHeaderType.SHT_REL or rel.info not in index:
             continue
         for off, info in _rel_entries(rel):
-            where = index[rel.info].locate(off)
-            if where is not None:
-                inner.setdefault(where[0].new_shndx, bytearray()).extend(
-                    struct.pack('<II', where[1], info))
+            for plan, offset in index[rel.info].locate_all(off):
+                inner.setdefault(plan.new_shndx, bytearray()).extend(
+                    struct.pack('<II', offset, info))
     return inner
 
 
