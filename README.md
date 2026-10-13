@@ -83,8 +83,10 @@ literal pools and the code after them:
 "00101058","$d","Global",$d,00000008,".text"    <- foo's trailing pool, outside it
 ```
 
-A mapping row runs until the next one or the end of the symbol it sits in;
-its Size is only checked against that, and a disagreement is reported. A `$d`
+A mapping row runs until the next one or the end of the symbol it sits in.
+A `$d` whose Size ends sooner ends there: the unnamed bytes after it are
+taken for code, never as more of the pool. A Size that runs past the next
+row or symbol is reported and cut short. A `$d`
 row outside every symbol is unnamed data: right after a decompiled function
 it is that function's trailing pool, as above. Mapping rows are exempt from
 the unique-name check.
