@@ -29,21 +29,30 @@ Splitting an object out of `.rodata` means three things:
 
 The original bytes stay where they were, unlabelled. Nothing else in the
 section moves, so no other offset needs rewriting.
+
+Each function's trailing literal pool is split out the same way, into
+`.pool:<function>`, so that the pool the CSV labels `$d` after a decompiled
+function is compared, as data, against the one armcc emitted.
 """
 
 import struct
 from dataclasses import dataclass
 from pathlib import Path
 
-from .elf import ELFHeader, SectionHeaderType
+from .elf import ELFHeader, SectionHeaderFlags, SectionHeaderType
 from .util import RelocationType, get_name
 
 #: The base.ld output sections whose objects are given sections of their own.
 SPLIT_FROM = ('.rodata', '.data')
 
+#: Section-name prefix for a function's trailing literal pool.
+POOL_SEGMENT = '.pool'
+
 _SEP = ':'
 _STT_OBJECT = 1
+_STT_FUNC = 2
 _STT_SECTION = 3
+_GLOBAL_OBJECT = 0x11
 _SHF_INFO_LINK = 0x40
 #: One object is neither mergeable nor a string table, whatever its parent was.
 _SHF_MERGE_STRINGS = 0x30
@@ -52,6 +61,11 @@ _SHF_MERGE_STRINGS = 0x30
 def split_section_name(segment: str, name: str) -> str:
     """The section a split object lives in, on both sides."""
     return f'{segment}{_SEP}{name}'
+
+
+def pool_section(function: str) -> str:
+    """The section the literal pool after `function` is given, on both sides."""
+    return f'{POOL_SEGMENT}{_SEP}{function}'
 
 
 def split_sections_of(section_names: list[str]) -> dict[str, str]:
@@ -78,11 +92,13 @@ class _Section:  # pylint: disable=too-many-instance-attributes
 
 
 @dataclass(frozen=True)
-class _Object:
+class _Object:  # pylint: disable=too-many-instance-attributes
     sym_idx: int
     start: int
     end: int
     new_shndx: int
+    section: str
+    flags: int
 
 
 def _read(data: bytes) -> list[_Section] | None:
@@ -164,15 +180,16 @@ def split_data_objects(path: Path) -> int:
     names = [get_name(strtab, s[0]) if s[0] < len(strtab) else '' for s in syms]
 
     objects = _choose(sections, syms, names)
+    objects += _add_pool_symbols(sections, syms, names, symtab.link)
     if not objects:
         return 0
 
     # New data sections first, so their indices are known before the REL ones.
     by_parent: dict[int, list[_Object]] = {}
     first_new = len(sections)
-    for k, (shndx, sym_idx) in enumerate(objects):
+    for k, (shndx, sym_idx, sec_name, flags) in enumerate(objects):
         start = syms[sym_idx][1]
-        obj = _Object(sym_idx, start, start + syms[sym_idx][2], first_new + k)
+        obj = _Object(sym_idx, start, start + syms[sym_idx][2], first_new + k, sec_name, flags)
         by_parent.setdefault(shndx, []).append(obj)
     for objs in by_parent.values():
         objs.sort(key=lambda o: o.start)
@@ -185,10 +202,9 @@ def split_data_objects(path: Path) -> int:
     for shndx, objs in by_parent.items():
         parent = sections[shndx]
         for obj in objs:
-            name = split_section_name(parent.name, names[obj.sym_idx])
             align = obj.start & -obj.start or parent.align
             new_sections.append((obj.new_shndx, _Section(
-                name, SectionHeaderType.SHT_PROGBITS, parent.flags & ~_SHF_MERGE_STRINGS, 0, 0,
+                obj.section, SectionHeaderType.SHT_PROGBITS, obj.flags, 0, 0,
                 min(align, max(parent.align, 1)), 0,
                 bytearray(parent.data[obj.start:obj.end]))))
             syms[obj.sym_idx][1] = 0
@@ -204,13 +220,19 @@ def split_data_objects(path: Path) -> int:
     return len(objects)
 
 
-def _choose(sections: list[_Section], syms: list[list[int]],
-            names: list[str]) -> list[tuple[int, int]]:
-    """`(shndx, symbol index)` of every object worth a section of its own."""
+def _name_counts(names: list[str]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for name in names:
         if name:
             counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _choose(sections: list[_Section], syms: list[list[int]],
+            names: list[str]) -> list[tuple[int, int, str, int]]:
+    """`(shndx, symbol index, new section, flags)` of every object worth a
+    section of its own."""
+    counts = _name_counts(names)
     chosen = []
     for j, (_, value, size, info, _other, shndx) in enumerate(syms):
         if info & 0xF != _STT_OBJECT or not size or not 0 < shndx < len(sections):
@@ -218,7 +240,65 @@ def _choose(sections: list[_Section], syms: list[list[int]],
         sec = sections[shndx]
         if (sec.name in SPLIT_FROM and sec.type == SectionHeaderType.SHT_PROGBITS
                 and counts.get(names[j]) == 1 and value + size <= len(sec.data)):
-            chosen.append((shndx, j))
+            chosen.append((shndx, j, split_section_name(sec.name, names[j]),
+                           sec.flags & ~_SHF_MERGE_STRINGS))
+    return chosen
+
+
+def _is_mapping(name: str, kind: str) -> bool:
+    """armcc's `$d`, `$a` and `$t`, also in their `$d.realdata` forms."""
+    return name == kind or name.startswith(kind + '.')
+
+
+def _add_pool_symbols(sections: list[_Section], syms: list[list[int]], names: list[str],
+                      strtab_idx: int) -> list[tuple[int, int, str, int]]:
+    """Give each function's trailing literal pool a symbol, and choose it.
+
+    armcc marks where data begins with a `$d` mapping symbol, so the pool is
+    read off the compiler's own output rather than worked out: it starts at
+    the first `$d` after the function's end and runs, across any further
+    `$d`, to the next `$a`/`$t`, the next sized symbol or the end of the
+    section. The target pairs the `$d` labels after the same function with it
+    (`_route_data` in objdiff.py). The new symbols are appended as globals, after every local,
+    as the symbol table requires.
+    """
+    counts = _name_counts(names)
+    code_marks: dict[int, list[int]] = {}
+    data_marks: dict[int, list[int]] = {}
+    sized: dict[int, list[tuple[int, int]]] = {}
+    for j, (_, value, size, info, _other, shndx) in enumerate(syms):
+        if not 0 < shndx < len(sections):
+            continue
+        if _is_mapping(names[j], '$d'):
+            data_marks.setdefault(shndx, []).append(value)
+        elif _is_mapping(names[j], '$a') or _is_mapping(names[j], '$t'):
+            code_marks.setdefault(shndx, []).append(value)
+        elif size and info & 0xF in (_STT_FUNC, _STT_OBJECT):
+            sized.setdefault(shndx, []).append((value & ~1, j))
+
+    strtab = sections[strtab_idx].data
+    chosen = []
+    for shndx, entries in sized.items():
+        sec = sections[shndx]
+        if not sec.flags & SectionHeaderFlags.SHF_EXECINSTR:
+            continue
+        entries.sort()
+        bounds = sorted({*code_marks.get(shndx, []), *(e[0] for e in entries), len(sec.data)})
+        starts = sorted(data_marks.get(shndx, []))
+        for start, j in entries:
+            if syms[j][3] & 0xF != _STT_FUNC or counts.get(names[j]) != 1:
+                continue
+            end = start + syms[j][2]
+            limit = next(b for b in bounds if b >= end)
+            pool = next((a for a in starts if end <= a < limit), None)
+            if pool is None:
+                continue
+            pool_end = next(b for b in bounds if b > pool)
+            syms.append([len(strtab), pool, pool_end - pool, _GLOBAL_OBJECT, 0, shndx])
+            names.append(names[j] + '$pool')
+            strtab += names[-1].encode('utf-8') + b'\x00'
+            chosen.append((shndx, len(syms) - 1, pool_section(names[j]),
+                           int(SectionHeaderFlags.SHF_ALLOC)))
     return chosen
 
 

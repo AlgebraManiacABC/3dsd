@@ -140,6 +140,7 @@ class BaseObject:
     def __init__(self, names: list[str], contents: list[bytes | None],
                  symbols: list[BaseSymbol], relocs: dict[int, list[BaseReloc]]):
         self.names = names
+        self._index = {name: i for i, name in enumerate(names)}
         self.contents = contents
         self.relocs = relocs
         self.by_name: dict[str, list[BaseSymbol]] = {}
@@ -166,6 +167,12 @@ class BaseObject:
         for sym in self.by_name.get(name, []):
             if self.names[sym.shndx] == section and sym.size:
                 return sym
+        # A section holding a single split object (`.pool:<function>`) pairs
+        # whole, whatever each side calls the object in it.
+        shndx = self._index.get(section) if ':' in section else None
+        inside = self._named.get(shndx, []) if shndx is not None else []
+        if len(inside) == 1:
+            return inside[0]
         return None
 
     def relocs_in(self, sym: BaseSymbol) -> dict[int, BaseReloc]:
@@ -444,8 +451,15 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
         symbol per function, so without these a pool decodes as instructions,
         and in Thumb a relocated pool word then straddles two of them.
         """
+        # A split section ('.pool:Func', '.rodata:gTable') is one object in the
+        # base but may be several labels in the target -- a pool the CSV marks
+        # word by word -- so it is handled whole, from its first byte.
+        split: dict[str, list[Symbol]] = {}
         for sym in syms:
             if sym.is_stdlib or sym.name.startswith('pad_'):
+                continue
+            if ':' in sym.segment:
+                split.setdefault(sym.segment, []).append(sym)
                 continue
             twin = self.base.twin(sym.name, sym.segment)
             if twin is None:
@@ -454,6 +468,12 @@ class RelocRecovery:  # pylint: disable=too-few-public-methods
                 self._function(sym, twin)
             else:
                 self._data(sym, twin)
+        for segment, parts in split.items():
+            twin = self.base.twin(parts[0].name, segment)
+            if twin is not None:
+                start = min(p.addr for p in parts)
+                end = max(p.addr + p.size for p in parts)
+                self._data(Symbol(start, parts[0].name, '$d', end - start, segment), twin)
         return bytes(self.data), self.relocs
 
     def _function(self, sym: Symbol, twin: BaseSymbol):

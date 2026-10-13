@@ -55,7 +55,20 @@ already list it in `flags:` — it is not added twice — and a project without 
 directory is unaffected.
 
 Symbol CSVs have the header `Location,Name,Mode,Size,Segment`, e.g.
-`00100000,Entry,$a,00000002,".text"` (`$a` = ARM, `$t` = Thumb; hex sizes).
+`00100000,Entry,$a,00000002,".text"` (`$a` = ARM, `$t` = Thumb, `$d` = data;
+hex sizes).
+
+Every byte the CSV leaves unnamed has to be guessed at, and the pipeline does
+not guess: a gap becomes an unnamed `pad_` symbol, which in `.text` objdiff
+counts as an unmatched function. The commonest gap is a function's literal
+pool, which armcc places right after the function's last instruction, outside
+its symbol. Each build lists the gaps, those right after a decompiled
+function first. Label them in the CSV: a `$d` entry in `.text` is measured as
+data, not code. Every `$d` label between a decompiled function and the next
+code symbol belongs to that function's pool, gaps between them included, and
+the pool is compared with the one armcc emitted (cut at armcc's own `$d`
+mapping symbols), so a wrong constant or address shows in the data figures.
+Any other `$d` label goes with the undecompiled data.
 
 Put the title's `exheader.bin` in `orig/` too. It records where `code.bin`'s
 `.text`, `.rodata` and `.data` really begin and end, and when it is present

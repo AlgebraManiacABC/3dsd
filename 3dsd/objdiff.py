@@ -1,6 +1,7 @@
 """objdiff integration: target ELFs, objdiff.json, the base link and progress."""
 
 import ctypes
+import itertools
 import json
 import os
 import shutil
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from .config import ProjectConfig
 from .ctrtype import CRO, CTRBinary
-from .datasplit import split_data_objects, split_sections_of
+from .datasplit import POOL_SEGMENT, pool_section, split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
 from .reloc import BaseObject, RelocRecovery, read_base
 from .util import Symbol, posix, sanitize
@@ -87,7 +88,8 @@ SKIP_SEGMENT = '.undecompiled'
 
 
 def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
-                split: dict[str, str] | None = None) -> list[Symbol]:
+                split: dict[str, str] | None = None,
+                pools: set[str] | None = None) -> list[Symbol]:
     """Send each data symbol to the section that lets it pair, or out of the way.
 
     A decompiled object takes the section armcc put the base's copy in, not the
@@ -100,12 +102,27 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
     datasplit.py) goes to the section of the same name, so it pairs, and
     scores, alone.
 
+    A `$d` label in .text is data too, never a function. Every one between a
+    function whose compiled pool the base has split out (`pools`) and the next
+    code symbol belongs to that function's literal pool and goes to the same
+    `.pool:<function>` section, so the two are compared; any other goes with
+    the undecompiled data.
+
     Applied before the gaps are filled, so the padding between two undecompiled
     data objects inherits the skipped segment too and stays out of the diff.
     """
     split = split or {}
+    owners = _pool_owners(symbols, pools or set())
     out = []
     for sym in symbols:
+        if sym.segment == '.text' and sym.mode == '$d':
+            # Data inside the code segment -- a literal pool, a jump table --
+            # labelled as such in the CSV.
+            owner = owners.get(id(sym))
+            section = pool_section(owner) if owner is not None else SKIP_SEGMENT
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
+                              section, sym.namespace))
+            continue
         if sym.segment not in DATA_SEGMENTS:
             out.append(sym)
             continue
@@ -114,6 +131,46 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
             section = split.get(sym.name, section)
         out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size,
                           section, sym.namespace))
+    return out
+
+
+def _pool_owners(symbols: list[Symbol], pools: set[str]) -> dict[int, str]:
+    """`{id(label): function}` for each `$d` label in .text that follows a
+    function in `pools`, up to the next code symbol."""
+    owners: dict[int, str] = {}
+    text = sorted((s for s in symbols if s.segment == '.text'), key=lambda s: s.addr)
+    owner = None
+    for sym in text:
+        if sym.mode in ('$a', '$t'):
+            owner = sym.name if sym.name in pools else None
+        elif owner is not None:
+            owners[id(sym)] = owner
+    return owners
+
+
+def _keep_text_gaps(symbols: list[Symbol], csv: list[Symbol]) -> list[Symbol]:
+    """Settle the gaps after `$d` labels in .text.
+
+    A gap between two labels of the same pool is part of that pool: the
+    compiled pool runs unbroken from its first word to its last, so leaving
+    the gap out would make the two differ by its bytes. Any other gap after a
+    label stays code. It would otherwise take the label's data segment and
+    quietly count whatever unnamed bytes follow -- alignment, or code nobody
+    has labelled -- as data; what they are is for the CSV to say.
+
+    Runs after `_skip_data_padding`, which would send the pool's own gaps
+    to the undecompiled data.
+    """
+    label_ends = {s.addr + s.size for s in csv if s.segment == '.text' and s.mode == '$d'}
+    out = list(symbols)
+    for i, sym in enumerate(out):
+        if not sym.name.startswith('pad_') or sym.addr not in label_ends:
+            continue
+        before = out[i - 1].segment if i > 0 else None
+        after = out[i + 1].segment if i + 1 < len(out) else None
+        in_pool = before is not None and before == after and before.startswith(POOL_SEGMENT)
+        segment = before if in_pool else '.text'
+        out[i] = Symbol(sym.addr, sym.name, sym.mode, sym.size, segment, sym.namespace)
     return out
 
 
@@ -138,7 +195,8 @@ def _skip_data_padding(symbols: list[Symbol]) -> list[Symbol]:
 
 def _is_data(segment: str) -> bool:
     """Whether a segment pairs with base data: `.rodata`, `.data`, or one object's own."""
-    return segment in DATA_SEGMENTS or segment.partition(':')[0] in DATA_SEGMENTS
+    parent = segment.partition(':')[0]
+    return segment in DATA_SEGMENTS or parent in DATA_SEGMENTS or parent == POOL_SEGMENT
 
 
 def generate_target_elfs(config: ProjectConfig):
@@ -157,8 +215,12 @@ def generate_target_elfs(config: ProjectConfig):
         base_path = config.out_dir / 'objdiff_base' / name
         base = read_base(base_path.read_bytes()) if base_path.exists() else None
         split = split_sections_of(base.names) if base is not None else {}
-        raw = _route_data(csv, decompiled, split)
-        syms = _skip_data_padding(_complete_symbols(raw, len(data)))
+        pools = {n.partition(':')[2] for n in base.names
+                 if n.startswith(POOL_SEGMENT + ':')} if base is not None else set()
+        raw = _route_data(csv, decompiled, split, pools)
+        syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
+        _warn_unnamed(name, syms, binary.base_addr,
+                      set(base.by_name) if base is not None else set())
         data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms)
         out = target_dir / name
         write_target_elf(out, data, syms, relocs, mapping)
@@ -166,6 +228,41 @@ def generate_target_elfs(config: ProjectConfig):
         labelled = len(syms) - sum(1 for s in syms if s.is_stdlib)
         note = f", {std_bytes:,} std bytes discounted" if std_bytes else ""
         print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note}{rel_note} -> {out}")
+
+
+def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[str]):
+    """Report the bytes the symbol CSV leaves unnamed.
+
+    The pipeline cannot tell what such a region is -- ARM code, Thumb code,
+    or data such as a literal pool -- so it is written as an unnamed `pad_`
+    symbol: code in .text, where objdiff counts it as an unmatched function,
+    or undecompiled data elsewhere. Only the CSV can say otherwise, so the
+    gaps are listed for it to be filled in. Those right after a compiled
+    function come first: they are most often its literal pool, which objdiff
+    then never compares.
+    """
+    pads = [s for s in syms if s.name.startswith('pad_') and not s.is_stdlib]
+    if not pads:
+        return
+    code = [p for p in pads if p.segment == '.text']
+    code_bytes = sum(p.size for p in code)
+    data_bytes = sum(p.size for p in pads) - code_bytes
+    print(f"  Warning: {name}: {len(pads):,} region(s) the symbol CSV does not name "
+          f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
+          f"Label them as $a/$t/$d in the CSV.")
+    previous = {}
+    for before, sym in itertools.pairwise(syms):
+        previous[sym.addr] = before
+    after_compiled = [p for p in code
+                      if previous.get(p.addr) is not None and previous[p.addr].name in compiled]
+    if after_compiled:
+        print(f"    {len(after_compiled):,} directly follow a decompiled function "
+              f"(likely its literal pool, left uncompared):")
+        for pad in after_compiled[:5]:
+            print(f"      {base_addr + pad.addr:08x} +{pad.size:<5} after "
+                  f"{previous[pad.addr].name}")
+        if len(after_compiled) > 5:
+            print(f"      ... and {len(after_compiled) - 5:,} more")
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,
