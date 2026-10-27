@@ -311,6 +311,11 @@ the objdiff base ELF, and prints progress. It does not touch `split/`: the
 objdiff target is cut from the original binary and the symbol CSV, so decomp
 progress never needs the originals taken apart.
 
+Compiler output is condensed. A file that compiles with warnings takes one
+line, its warnings counted rather than shown --
+`[12/3562] src/code.bin/foo.c: 2 warnings`, in orange -- and a file with
+errors prints the compiler's full output in red.
+
 ```bash
 python -m 3dsd build . --roundtrip
 ```

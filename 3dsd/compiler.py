@@ -1,7 +1,9 @@
 """Running armcc, and reading back which symbols a compiled object defines."""
 
 import os
+import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,9 +27,63 @@ def compile_source(source: Path, output: Path, cc: Path, flags: list[str],
     include search fails."""
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [str(cc), *flags, '-c', str(source), '-o', str(output)]
-    result = subprocess.run(cmd, cwd=cwd, env=_cc_env(cc), check=False)
+    result = subprocess.run(cmd, cwd=cwd, env=_cc_env(cc), check=False,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors='replace')
     if result.returncode != 0:
         output.write_bytes(b'')
+    report = summarize(source, result.stdout, result.returncode)
+    if report:
+        print(report, flush=True)
+
+
+#: ANSI colours for the compile summary: red for errors, orange for warnings.
+RED = '\x1b[31m'
+ORANGE = '\x1b[38;5;208m'
+RESET = '\x1b[0m'
+
+_SUMMARY = re.compile(r'(\d+) warnings?, (\d+) errors?')
+
+
+def count_diagnostics(text: str) -> tuple[int, int]:
+    """`(warnings, errors)` armcc reported, from its own closing tally.
+
+    armcc ends with `file: 2 warnings, 0 errors`; when that line is missing
+    (a crash, a driver error) the individual diagnostics are counted instead.
+    """
+    tallies = _SUMMARY.findall(text)
+    if tallies:
+        return (sum(int(w) for w, _ in tallies), sum(int(e) for _, e in tallies))
+    warnings = len(re.findall(r':\s+Warning:', text))
+    errors = len(re.findall(r':\s+(?:Error|Fatal error):', text))
+    return warnings, errors
+
+
+def summarize(source: Path, text: str, returncode: int) -> str:
+    """What a compile prints: nothing, one orange line, or the errors in red.
+
+    Warnings are counted, not shown -- a decompilation produces the same
+    implicit-declaration warning thousands of times. Errors are shown in full,
+    since they are what a build log is read for. A failed compile with no
+    tally (the compiler could not start, say) counts as an error too.
+    """
+    warnings, errors = count_diagnostics(text)
+    color = _use_color()
+    if errors or returncode != 0:
+        body = text.rstrip() or f'{source.as_posix()}: compiler exited with {returncode}'
+        return f'{RED}{body}{RESET}' if color else body
+    if warnings:
+        line = f"{source.as_posix()}: {warnings} warning{'s' if warnings != 1 else ''}"
+        return f'{ORANGE}{line}{RESET}' if color else line
+    return ''
+
+
+def _use_color() -> bool:
+    """Colour unless NO_COLOR; forced under `3dsd build`, which reads ninja's
+    output through a pipe and sets CLICOLOR_FORCE so the escapes survive."""
+    if os.environ.get('NO_COLOR'):
+        return False
+    return bool(os.environ.get('CLICOLOR_FORCE')) or sys.stdout.isatty()
 
 
 def _cc_env(cc: Path) -> dict:
