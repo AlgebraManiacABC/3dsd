@@ -10,7 +10,9 @@ from pathlib import Path
 from .config import ProjectConfig
 from .ninja import generate_ninja
 from .objdiff import generate_objdiff, report_progress, supports_color
+from .partial import find_project_root, run_partial
 from .split import run_split
+from .util import PipelineError
 
 
 def _find_ninja() -> str | None:
@@ -23,8 +25,32 @@ def _find_ninja() -> str | None:
     return shutil.which('ninja')
 
 
-def run_build(working_dir: Path, jobs: int | None, keep_going: bool,
-              targets: list[str] | None, roundtrip: bool = False) -> bool:
+def run_build(path: Path, jobs: int | None, keep_going: bool,  # pylint: disable=too-many-arguments,too-many-positional-arguments
+              targets: list[str] | None, roundtrip: bool = False,
+              symbol: str | None = None) -> bool:
+    """Build what `path` names; True if everything built.
+
+    The project directory itself is a full build. A directory or file inside
+    a project is a partial one (partial.py): only the sources under it are
+    compiled and measured. `symbol` narrows a partial build to one symbol.
+    """
+    root = find_project_root(path)
+    if root is None:
+        raise PipelineError(f"{path} is not in a 3dsd project (no cc.yaml and symbols/ "
+                            f"in it or any directory above).")
+    if path.resolve() != root:
+        if roundtrip or targets:
+            raise PipelineError("--roundtrip and ninja targets apply to a full build; "
+                                "give the project directory for one.")
+        return run_partial(root, path.resolve(), jobs, symbol)
+    if symbol is not None:
+        raise PipelineError(f"--symbol needs the file that defines it: "
+                            f"build <path/to/source.c> --symbol {symbol}")
+    return _run_full(root, jobs, keep_going, targets, roundtrip)
+
+
+def _run_full(working_dir: Path, jobs: int | None, keep_going: bool,
+              targets: list[str] | None, roundtrip: bool) -> bool:
     """Run the whole pipeline once; True if ninja succeeded."""
     config = ProjectConfig.load(working_dir)
 

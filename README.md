@@ -316,6 +316,26 @@ line, its warnings counted rather than shown --
 `[12/3562] src/code.bin/foo.c: 2 warnings`, in orange -- and a file with
 errors prints the compiler's full output in red.
 
+### Building part of a project
+
+Give `build` a directory or file inside the project instead of the project
+itself, and only that part is built and measured:
+
+```bash
+python -m 3dsd build src/code.bin/Item              # every source under Item/
+python -m 3dsd build src/code.bin/Item/Item.c       # one file
+python -m 3dsd build src/code.bin/Item/Item.c --symbol Item_Clear   # one symbol of it
+```
+
+The project is found by walking up from the path to the nearest directory
+with a `cc.yaml` and `symbols/`. Only the named sources are compiled, with
+everything the compiler says about each shown in full. They are linked into
+a base of their own, and the target measures only the symbols they define
+(or the one `--symbol` names); every other byte keeps its place, unmeasured.
+The report lists each function and data object with its match. Everything
+goes to `out/partial/`: `build.ninja`, the project's `objdiff.json`, its
+base and target and `out/report.json` stay as the last full build left them.
+
 ```bash
 python -m 3dsd build . --roundtrip
 ```

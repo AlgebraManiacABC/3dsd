@@ -25,6 +25,17 @@ def compile_source(source: Path, output: Path, cc: Path, flags: list[str],
     project-relative paths (`-Iinclude`): ninja runs the compile rule from
     there, and section discovery has to use the same directory or the
     include search fails."""
+    returncode, text = compile_capture(source, output, cc, flags, cwd)
+    report = summarize(source, text, returncode)
+    if report:
+        print(report, flush=True)
+
+
+def compile_capture(source: Path, output: Path, cc: Path, flags: list[str],
+                    cwd: Path | None = None) -> tuple[int, str]:
+    """Compile a translation unit; `(returncode, everything armcc printed)`.
+
+    Writes an empty object on failure, as `compile_source` does."""
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [str(cc), *flags, '-c', str(source), '-o', str(output)]
     result = subprocess.run(cmd, cwd=cwd, env=_cc_env(cc), check=False,
@@ -32,9 +43,30 @@ def compile_source(source: Path, output: Path, cc: Path, flags: list[str],
                             text=True, errors='replace')
     if result.returncode != 0:
         output.write_bytes(b'')
-    report = summarize(source, result.stdout, result.returncode)
-    if report:
-        print(report, flush=True)
+    return result.returncode, result.stdout
+
+
+def describe(source: Path, text: str, returncode: int) -> str:
+    """Everything a compile printed, its tally coloured: what a partial build
+    shows, where the warnings are few enough to be worth reading.
+
+    armcc ends with its own tally (`foo.c: 1 warning, 0 errors`), which is
+    coloured in place; one is added when it is missing. Errors are red
+    throughout, as in a full build.
+    """
+    warnings, errors = count_diagnostics(text)
+    failed = errors or returncode != 0
+    if not failed and not warnings:
+        return f'{source.as_posix()}: ok'
+    lines = text.rstrip().splitlines()
+    if not lines or not _SUMMARY.search(lines[-1]):
+        lines.append(f"{source.as_posix()}: {warnings} warning{'s' if warnings != 1 else ''}, "
+                     f"{errors} error{'s' if errors != 1 else ''}")
+    if not _use_color():
+        return '\n'.join(lines)
+    if failed:
+        return f"{RED}{chr(10).join(lines)}{RESET}"
+    return '\n'.join([*lines[:-1], f'{ORANGE}{lines[-1]}{RESET}'])
 
 
 #: ANSI colours for the compile summary: red for errors, orange for warnings.
