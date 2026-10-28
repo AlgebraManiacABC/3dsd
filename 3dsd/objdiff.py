@@ -210,32 +210,75 @@ def generate_target_elfs(config: ProjectConfig):
     """
     target_dir = config.out_dir / 'objdiff_target'
     target_dir.mkdir(parents=True, exist_ok=True)
-    for name, binary in config.binaries.items():
-        data = binary.data
-        decompiled = config.get_decompiled_data(name)
-        csv, marks = _place_markers(name, config.symbols.get(name, []),
-                                    config.markers.get(name, []), len(data), binary.base_addr)
-        base_path = config.out_dir / 'objdiff_base' / name
-        base = read_base(base_path.read_bytes()) if base_path.exists() else None
-        split = split_sections_of(base.names) if base is not None else {}
-        pools = {n.partition(':')[2] for n in base.names
-                 if n.startswith(POOL_SEGMENT + ':')} if base is not None else set()
-        raw = _route_data(csv, decompiled, split, pools)
-        syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
+    for name in config.binaries:
+        build_target(config, name, config.out_dir / 'objdiff_base' / name, target_dir / name,
+                     config.get_decompiled_data(name))
+
+
+#: Where a partial build puts everything outside its scope (see `_apply_scope`).
+OUT_OF_SCOPE = '.outofscope'
+
+
+def build_target(config: ProjectConfig, name: str,  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+                 base_path: Path, out: Path, decompiled: dict[str, str],
+                 scope: set[str] | None = None):
+    """Write one binary's objdiff target ELF, against the base at `base_path`.
+
+    With `scope`, only the symbols named in it are measured (a partial build,
+    see build.py): every other byte stays in place, but code outside it is
+    left unnamed and data goes to a section objdiff does not measure.
+    """
+    binary = config.binaries[name]
+    data = binary.data
+    csv, marks = _place_markers(name, config.symbols.get(name, []),
+                                config.markers.get(name, []), len(data), binary.base_addr)
+    base = read_base(base_path.read_bytes()) if base_path.exists() else None
+    split = split_sections_of(base.names) if base is not None else {}
+    pools = {n.partition(':')[2] for n in base.names
+             if n.startswith(POOL_SEGMENT + ':')} if base is not None else set()
+    raw = _route_data(csv, decompiled, split, pools)
+    syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
+    if scope is None:
         _warn_unnamed(name, syms, binary.base_addr,
                       set(base.by_name) if base is not None else set())
-        if base is not None:
-            syms, cut = _cut_pools(syms, marks, set(base.names))
-            # A cut function's markers are spent: its pieces are its sections.
-            marks.mapping = [m for m in marks.mapping
-                             if not any(a <= m[0] < b for a, b in cut)]
-        data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms, marks)
-        out = target_dir / name
-        write_target_elf(out, data, syms, relocs, marks.mapping + mapping)
+    if base is not None:
+        syms, cut = _cut_pools(syms, marks, set(base.names))
+        # A cut function's markers are spent: its pieces are its sections.
+        marks.mapping = [m for m in marks.mapping
+                         if not any(a <= m[0] < b for a, b in cut)]
+    if scope is not None:
+        syms = _apply_scope(syms, scope)
+    data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms, marks,
+                                                      warn=scope is None)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    write_target_elf(out, data, syms, relocs, marks.mapping + mapping)
+    if scope is None:
         std_bytes = sum(s.size for s in syms if s.is_stdlib)
         labelled = len(syms) - sum(1 for s in syms if s.is_stdlib)
         note = f", {std_bytes:,} std bytes discounted" if std_bytes else ""
         print(f"  {name}: {len(data):,} bytes, {labelled} symbols{note}{rel_note} -> {out}")
+
+
+def _apply_scope(syms: list[Symbol], scope: set[str]) -> list[Symbol]:
+    """Keep only the symbols in `scope` measurable.
+
+    A symbol is in scope by its name, or by the name its split section
+    carries (`.pool:Func`, `.text:Func`, `.rodata:gTable`). Out-of-scope code
+    stays in `.text` and out-of-scope data goes to a section objdiff does not
+    measure; both are left unnamed, the way `std` code is discounted. The
+    bytes keep their place, and a relocation reaching one of them names it
+    through an undefined symbol, which objdiff pairs with the base's by name
+    whether or not the base defines it.
+    """
+    out = []
+    for sym in syms:
+        if sym.name in scope or sym.segment.partition(':')[2] in scope:
+            out.append(sym)
+        elif sym.segment.partition(':')[0] == '.text':
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size, sym.segment, 'std'))
+        else:
+            out.append(Symbol(sym.addr, sym.name, sym.mode, sym.size, OUT_OF_SCOPE, 'std'))
+    return out
 
 
 @dataclass
@@ -429,7 +472,7 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers"):
+                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers", warn: bool = True):
     """`(data, relocs, mapping, note)`: the target's bytes, relocations and
     literal-pool mapping symbols, recovered against its base."""
     if base is None:
@@ -440,7 +483,8 @@ def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disab
                              pointers=not isinstance(binary.binary, CRO))
     recovery.marked = marks.functions
     data, relocs = recovery.run(syms)
-    _warn_unmarked(binary.name, syms, base, marks.functions, binary.base_addr)
+    if warn:
+        _warn_unmarked(binary.name, syms, base, marks.functions, binary.base_addr)
     note = f", {len(relocs):,} relocations"
     if recovery.unresolved:
         note += f" ({recovery.unresolved:,} references reach no CSV symbol)"
@@ -702,23 +746,36 @@ def format_table(rows: list[list[tuple]], total_row: list[tuple] | None = None,
     return '\n'.join(parts)
 
 
-def report_progress(config: ProjectConfig):
-    """Report decomp progress using objdiff-cli."""
+def find_objdiff_cli(config: ProjectConfig) -> str | None:
+    """objdiff-cli on PATH, else in tools/."""
     cli = shutil.which('objdiff-cli')
     if not cli:
         for name in ('objdiff-cli', 'objdiff-cli.exe'):
             candidate = config.tool_dir / name
             if candidate.exists():
-                cli = str(candidate)
-                break
+                return str(candidate)
+    return cli
+
+
+def report_progress(config: ProjectConfig, project_dir: Path | None = None,
+                    detail: bool = False):
+    """Report decomp progress using objdiff-cli.
+
+    `project_dir` is the directory holding objdiff.json (the project's own by
+    default; a partial build writes its own). With `detail`, every measured
+    function and data section is listed with its match too.
+    """
+    cli = find_objdiff_cli(config)
     if not cli:
         print("  objdiff-cli not found — install it for progress reporting.")
         return
+    project_dir = project_dir or config.working_dir
+    report_dir = config.out_dir if project_dir == config.working_dir else project_dir
 
     # Pretty-printed so the saved report.json is readable and diffs line by
     # line; json.loads below does not care either way.
     result = subprocess.run([cli, 'report', 'generate', '--format', 'json-pretty'],
-                            cwd=config.working_dir, capture_output=True, text=True,
+                            cwd=project_dir, capture_output=True, text=True,
                             check=False)
     if result.returncode != 0:
         stderr = result.stderr.strip()
@@ -729,7 +786,7 @@ def report_progress(config: ProjectConfig):
     # Persist the full report before parsing: only a few summary fields are
     # printed, and the per-symbol detail is useful for inspection and diffing.
     # Written verbatim so it matches what objdiff-cli produces elsewhere (CI).
-    report_path = config.out_dir / 'report.json'
+    report_path = report_dir / 'report.json'
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(result.stdout)
     print(f"  Full report: {report_path}")
@@ -750,6 +807,26 @@ def report_progress(config: ProjectConfig):
     total = (measure_row(report.get('measures', {}), 'Total', all_sections)
              if len(units) > 1 else None)
     print(format_table(rows, total))
+    if detail:
+        print(format_detail(units))
+
+
+def format_detail(units: list[dict], color: bool | None = None) -> str:
+    """One line per measured function and data section, with its match."""
+    if color is None:
+        color = supports_color()
+    lines = []
+    for unit in units:
+        items = [(f.get('name', '?'), int(f.get('size', 0)), f.get('fuzzy_match_percent'))
+                 for f in unit.get('functions', [])]
+        items += [(s.get('name', '?'), int(s.get('size', 0)), s.get('fuzzy_match_percent'))
+                  for s in unit.get('sections', []) if ':' in s.get('name', '')
+                  and not s.get('name', '').startswith('.text:')]
+        for item_name, size, pct in items:
+            pct = float(pct or 0.0)
+            cell = _paint(f'{pct:8.2f}%', pct / 100, color)
+            lines.append(f'  {cell}  {size:>6}  {item_name}')
+    return '\n'.join(lines)
 
 
 def _rel(path: Path, base: Path) -> Path:

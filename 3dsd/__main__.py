@@ -38,7 +38,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     project_command('objdiff', 'Generate objdiff.json')
 
-    p_build = project_command('build', 'Run ninja build', single_binary=False)
+    p_build = sub.add_parser('build', help='Build the project, or part of it')
+    p_build.add_argument('dir', metavar='path',
+                         help='The project directory for a full build, or a directory or '
+                              'source file inside it to build and measure only that')
+    p_build.add_argument('--symbol', metavar='NAME',
+                         help='With a source file: measure only this symbol of it')
     p_build.add_argument('-j', '--jobs', type=int, default=None,
                          help='Number of parallel jobs')
     p_build.add_argument('-k', '--keep-going', action='store_true',
@@ -110,7 +115,7 @@ def _run(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-st
         case 'build':
             from .build import run_build
             ok = run_build(Path(args.dir), args.jobs, args.keep_going,
-                           args.targets, args.roundtrip)
+                           args.targets, args.roundtrip, args.symbol)
             return 0 if ok else 1
         case 'check':
             from .check import run_check

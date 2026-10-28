@@ -78,6 +78,9 @@ _SECTION_FLAGS = {
               SectionHeaderFlags.SHF_ALLOC | SectionHeaderFlags.SHF_WRITE),
     '.bss': (SectionHeaderType.SHT_NOBITS,
              SectionHeaderFlags.SHF_ALLOC | SectionHeaderFlags.SHF_WRITE),
+    # Bytes outside a partial build's scope: not allocated, so objdiff treats
+    # the section as neither code nor data and measures none of it.
+    '.outofscope': (SectionHeaderType.SHT_PROGBITS, 0),
 }
 _DEFAULT_SECTION_FLAGS = (SectionHeaderType.SHT_PROGBITS, SectionHeaderFlags.SHF_ALLOC)
 
