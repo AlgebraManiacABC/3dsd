@@ -307,7 +307,10 @@ python -m 3dsd build .
 ```
 
 This generates `build.ninja` and `objdiff.json`, compiles every source, links
-the objdiff base ELF, and prints progress. It does not touch `split/`: the
+the objdiff base ELF, cuts the objdiff target, and prints progress. Every step
+up to and including objdiff-cli's report is a ninja edge, so a build with
+nothing changed skips them all and `.ninja_log` times each one; `ninja
+progress` builds just the report. It does not touch `split/`: the
 objdiff target is cut from the original binary and the symbol CSV, so decomp
 progress never needs the originals taken apart.
 

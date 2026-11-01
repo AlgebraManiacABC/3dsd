@@ -303,10 +303,6 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
                     found[sanitize(name)] = info.segment
         return found
 
-    def forget_objects(self):
-        """Drop the symbols read from objects, so the next use rereads them."""
-        self._symbol_info.clear()
-
     def _discovered_symbols(self, bin_name: str) -> dict[str, dict[str, SymbolInfo]]:
         """`{src_key: {symbol: SymbolInfo}}` for every object already compiled.
 

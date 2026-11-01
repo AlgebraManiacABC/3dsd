@@ -21,14 +21,13 @@ objdiff.json, base and target, and the full report all stay as the last
 full build left them.
 """
 
-import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .compiler import compile_capture, describe, discover_symbols
 from .config import ProjectConfig
-from .objdiff import build_target, link_base, report_progress
+from .objdiff import build_target, link_base, report_progress, write_objdiff_json
 from .util import PipelineError, posix, sanitize
 
 PARTIAL_DIR = 'partial'
@@ -87,22 +86,12 @@ def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -
 
         target = out_dir / 'target' / bin_name
         build_target(config, bin_name, base, target, decompiled, scope_names)
-        units.append({
-            "name": bin_name,
-            "target_path": posix(target.relative_to(out_dir)),
-            "base_path": posix(base.relative_to(out_dir)),
-            "metadata": {"progress_categories": [bin_name]},
-        })
+        units.append((bin_name, posix(target.relative_to(out_dir)),
+                      posix(base.relative_to(out_dir))))
 
     if not units:
         return False
-    (out_dir / 'objdiff.json').write_text(json.dumps({
-        "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
-        "build_target": False,
-        "build_base": False,
-        "units": units,
-        "progress_categories": [{"id": u["name"], "name": u["name"]} for u in units],
-    }, indent=2))
+    write_objdiff_json(out_dir / 'objdiff.json', units)
 
     _print("=== Progress ===")
     report_progress(config, project_dir=out_dir, detail=True)

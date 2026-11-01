@@ -492,7 +492,10 @@ def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disab
 
 
 def generate_objdiff(config: ProjectConfig):
-    """Generate objdiff.json for decomp progress tracking."""
+    """Generate the target ELFs and objdiff.json for decomp progress tracking.
+
+    A build does the same through ninja (ninja.py); this is the by-hand path.
+    """
     generate_target_elfs(config)
 
     units = []
@@ -503,26 +506,30 @@ def generate_objdiff(config: ProjectConfig):
             print(f"  Warning: no base ELF for {name}: the objdiff base link "
                   f"has not run or failed. Progress will read as 0%; run "
                   f"'ninja objdiff' and check the LINK_BASE output.")
-        unit = {
-            "name": name,
-            "target_path": posix(target_path),
-            "base_path": posix(_rel(base_elf, config.working_dir)) if base_elf.exists() else None,
-            "metadata": {
-                "progress_categories": [name],
-            },
-        }
-        units.append(unit)
+        base_path = _rel(base_elf, config.working_dir) if base_elf.exists() else None
+        units.append((name, posix(target_path), posix(base_path) if base_path else None))
+    out_path = config.working_dir / 'objdiff.json'
+    write_objdiff_json(out_path, units)
+    print(f"Generated {out_path}")
 
+
+def write_objdiff_json(path: Path, units: list[tuple[str, str, str | None]]):
+    """Write an objdiff project of `(name, target_path, base_path)` units.
+
+    Paths are relative to the file's directory; a unit without a base has
+    nothing compiled yet and reads as 0%.
+    """
     objdiff = {
         "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
         "build_target": False,
         "build_base": False,
-        "units": units,
-        "progress_categories": [{"id": n, "name": n} for n in config.binaries],
+        "units": [{"name": name, "target_path": target, "base_path": base,
+                   "metadata": {"progress_categories": [name]}}
+                  for name, target, base in units],
+        "progress_categories": [{"id": u[0], "name": u[0]} for u in units],
     }
-    out_path = config.working_dir / 'objdiff.json'
-    out_path.write_text(json.dumps(objdiff, indent=2))
-    print(f"Generated {out_path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(objdiff, indent=2))
 
 
 _COLUMNS = ('Binary', 'Code bytes', 'Code %', 'Fuzzy Code %',
@@ -746,53 +753,58 @@ def format_table(rows: list[list[tuple]], total_row: list[tuple] | None = None,
     return '\n'.join(parts)
 
 
-def find_objdiff_cli(config: ProjectConfig) -> str | None:
-    """objdiff-cli on PATH, else in tools/."""
+def find_objdiff_cli(tool_dir: Path) -> str | None:
+    """objdiff-cli on PATH, else in the project's tools/ directory."""
     cli = shutil.which('objdiff-cli')
     if not cli:
         for name in ('objdiff-cli', 'objdiff-cli.exe'):
-            candidate = config.tool_dir / name
+            candidate = tool_dir / name
             if candidate.exists():
                 return str(candidate)
     return cli
 
 
-def report_progress(config: ProjectConfig, project_dir: Path | None = None,
-                    detail: bool = False):
-    """Report decomp progress using objdiff-cli.
+def generate_report(tool_dir: Path, project_dir: Path, report_path: Path) -> bool:
+    """Run objdiff-cli on the objdiff.json in `project_dir`, saving its report.
 
-    `project_dir` is the directory holding objdiff.json (the project's own by
-    default; a partial build writes its own). With `detail`, every measured
-    function and data section is listed with its match too.
+    Returns whether `report_path` now holds a fresh report. On any failure it
+    is removed, so a stale report is never read as this build's.
     """
-    cli = find_objdiff_cli(config)
+    cli = find_objdiff_cli(tool_dir)
     if not cli:
+        report_path.unlink(missing_ok=True)
         print("  objdiff-cli not found — install it for progress reporting.")
-        return
-    project_dir = project_dir or config.working_dir
-    report_dir = config.out_dir if project_dir == config.working_dir else project_dir
+        return False
 
     # Pretty-printed so the saved report.json is readable and diffs line by
-    # line; json.loads below does not care either way.
+    # line; json.loads does not care either way.
     result = subprocess.run([cli, 'report', 'generate', '--format', 'json-pretty'],
                             cwd=project_dir, capture_output=True, text=True,
                             check=False)
     if result.returncode != 0:
+        report_path.unlink(missing_ok=True)
         stderr = result.stderr.strip()
         msg = stderr.splitlines()[-1] if stderr else 'unknown error'
         print(f"  objdiff-cli failed: {msg}")
-        return
+        return False
 
-    # Persist the full report before parsing: only a few summary fields are
-    # printed, and the per-symbol detail is useful for inspection and diffing.
-    # Written verbatim so it matches what objdiff-cli produces elsewhere (CI).
-    report_path = report_dir / 'report.json'
+    # Persisted whole: only a few summary fields are printed, and the
+    # per-symbol detail is useful for inspection and diffing. Written verbatim
+    # so it matches what objdiff-cli produces elsewhere (CI).
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(result.stdout)
-    print(f"  Full report: {report_path}")
+    return True
 
+
+def print_report(report_path: Path, detail: bool = False):
+    """Print the progress table from a saved report.
+
+    With `detail`, every measured function and data section is listed with
+    its match too.
+    """
+    print(f"  Full report: {report_path}")
     try:
-        report = json.loads(result.stdout)
+        report = json.loads(report_path.read_text())
     except json.JSONDecodeError:
         print("  objdiff-cli produced unparseable output")
         return
@@ -809,6 +821,20 @@ def report_progress(config: ProjectConfig, project_dir: Path | None = None,
     print(format_table(rows, total))
     if detail:
         print(format_detail(units))
+
+
+def report_progress(config: ProjectConfig, project_dir: Path | None = None,
+                    detail: bool = False):
+    """Generate and print a progress report using objdiff-cli.
+
+    `project_dir` is the directory holding objdiff.json (the project's own by
+    default; a partial build writes its own).
+    """
+    project_dir = project_dir or config.working_dir
+    report_dir = config.out_dir if project_dir == config.working_dir else project_dir
+    report_path = report_dir / 'report.json'
+    if generate_report(config.tool_dir, project_dir, report_path):
+        print_report(report_path, detail)
 
 
 def format_detail(units: list[dict], color: bool | None = None) -> str:

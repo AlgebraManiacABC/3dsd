@@ -79,6 +79,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_lb.add_argument('--output', required=True)
     p_lb.add_argument('--rsp', required=True)
 
+    p_tgt = sub.add_parser('objdiff-target', help="Cut one binary's objdiff target (internal)")
+    p_tgt.add_argument('dir', help='Project working directory')
+    p_tgt.add_argument('--binary', required=True)
+    p_tgt.add_argument('--output', required=True)
+
+    p_oj = sub.add_parser('objdiff-json', help='Write objdiff.json (internal)')
+    p_oj.add_argument('--output', required=True)
+    p_oj.add_argument('--unit', nargs=3, action='append', default=[],
+                      metavar=('NAME', 'TARGET', 'BASE'),
+                      help="One unit; BASE is '-' when there is none")
+
+    p_rep = sub.add_parser('report', help='Save the objdiff-cli report (internal)')
+    p_rep.add_argument('--tools', required=True, help="The project's tools/ directory")
+    p_rep.add_argument('--output', required=True)
+
     p_cro = sub.add_parser('cro-from-elf',
                            help='Flatten a linked ELF into a CRO module (internal)')
     p_cro.add_argument('--linked', required=True)
@@ -139,6 +154,19 @@ def _run(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-st
         case 'link-base':
             from .objdiff import link_base
             return link_base(Path(args.ld), Path(args.output), Path(args.rsp))
+        case 'objdiff-target':
+            from .config import ProjectConfig
+            from .objdiff import build_target
+            config = ProjectConfig.load(Path(args.dir), args.binary)
+            build_target(config, args.binary, config.out_dir / 'objdiff_base' / args.binary,
+                         Path(args.output), config.get_decompiled_data(args.binary))
+        case 'objdiff-json':
+            from .objdiff import write_objdiff_json
+            write_objdiff_json(Path(args.output), [(name, target, None if base == '-' else base)
+                                                   for name, target, base in args.unit])
+        case 'report':
+            from .objdiff import generate_report
+            generate_report(Path(args.tools), Path(), Path(args.output))
         case 'cro-from-elf':
             from .recreate import cro_from_elf
             cro_from_elf(Path(args.linked), Path(args.original),

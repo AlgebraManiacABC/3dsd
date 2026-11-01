@@ -1,4 +1,8 @@
-"""`3dsd build`: split (optionally), generate build.ninja, run ninja, report."""
+"""`3dsd build`: split (optionally), generate build.ninja, run ninja, report.
+
+Everything from compiling to objdiff-cli's report is a ninja step, so ninja
+skips what is current and times all of it; only printing the report is left.
+"""
 
 import os
 import re
@@ -9,7 +13,7 @@ from pathlib import Path
 
 from .config import ProjectConfig
 from .ninja import generate_ninja, manifest_is_current
-from .objdiff import generate_objdiff, report_progress, supports_color
+from .objdiff import print_report, supports_color
 from .partial import find_project_root, run_partial
 from .split import run_split
 from .util import PipelineError
@@ -82,20 +86,19 @@ def _run_full(working_dir: Path, jobs: int | None, keep_going: bool,
         cmd += targets
 
     if run_ninja(cmd) != 0:
-        # The base ELFs are whatever the last successful build left, so a
-        # report now would measure sources other than the ones on disk.
+        # The report is a ninja step after every compile and link, so a
+        # failure leaves it as the last successful build wrote it.
         _print("Build failed; objdiff.json and progress were not updated.")
         return False
 
-    # Objects read while generating build.ninja above may since have been
-    # recompiled.
-    config.forget_objects()
-
-    _print("=== Objdiff ===")
-    generate_objdiff(config)
-
-    _print("=== Progress ===")
-    report_progress(config)
+    # Built by default, or when asked for as `progress`.
+    report = config.out_dir / 'report.json'
+    if not targets or 'progress' in targets:
+        _print("=== Progress ===")
+        if report.exists():
+            print_report(report)
+        else:
+            _print("  No report: see the REPORT step above.")
 
     return True
 
