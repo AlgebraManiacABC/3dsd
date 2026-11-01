@@ -681,7 +681,7 @@ def supports_color(stream=None) -> bool:
         try:
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
-            mode = ctypes.c_ulong()
+            mode = ctypes.c_ulong(0)
             if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 return False
             vt_mode = mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
