@@ -82,10 +82,13 @@ def _run_full(working_dir: Path, jobs: int | None, keep_going: bool,
         cmd += ['-j', str(jobs)]
     if keep_going:
         cmd += ['-k', '0']
-    if targets:
-        cmd += targets
 
-    if run_ninja(cmd) != 0:
+    # build.ninja depends on every object, so ninja's first job is always to
+    # compile everything and regenerate it, then restart on the new graph.
+    # Newer ninja keeps the first pass's total across that restart, numbering
+    # the rest `[45/3629]`; two runs count each pass on its own.
+    if (run_ninja([*cmd, 'build.ninja'], quiet=True) != 0
+            or run_ninja([*cmd, *(targets or [])], quiet=True) != 0):
         # The report is a ninja step after every compile and link, so a
         # failure leaves it as the last successful build wrote it.
         _print("Build failed; objdiff.json and progress were not updated.")
@@ -109,7 +112,11 @@ _ANSI = re.compile(r'\x1b\[[0-9;]*m')
 _WARN_TALLY = re.compile(r'^(?:\x1b\[[0-9;]*m)?\S.*: \d+ warnings?(?:\x1b\[0m)?$')
 
 
-def run_ninja(cmd: list[str]) -> int:
+#: Lines `quiet` drops: said once per run, and a build is two runs.
+_CHATTER = re.compile(r'^ninja: (Entering directory|no work to do)')
+
+
+def run_ninja(cmd: list[str], quiet: bool = False) -> int:
     """Run ninja, folding each compile's warning tally into its status line.
 
     Ninja prints a job's status line and then whatever the job printed, so a
@@ -119,7 +126,8 @@ def run_ninja(cmd: list[str]) -> int:
     else a job prints, errors above all, follows its status line as usual.
 
     On a terminal, a status line nothing follows is overwritten by the next,
-    as ninja itself does; elsewhere (a CI log) every line is kept.
+    as ninja itself does; elsewhere (a CI log) every line is kept. `quiet`
+    drops ninja's "Entering directory" and "no work to do" lines.
     """
     tty = supports_color()
     env = dict(os.environ)
@@ -132,6 +140,8 @@ def run_ninja(cmd: list[str]) -> int:
                           text=True, errors='replace', bufsize=1) as proc:
         for raw in proc.stdout:
             line = raw.rstrip('\n')
+            if quiet and _CHATTER.match(line):
+                continue
             if _STATUS.match(_ANSI.sub('', line)):
                 if pending is not None and not tty:
                     _emit(pending, live)
