@@ -42,7 +42,7 @@ each of which only bites once a file holds more than one function.
 
 ### 1. Section discovery compiled in the wrong directory
 
-`ProjectConfig.get_source_map` pre-compiles a source to read its `i.NAME`
+`ProjectConfig.get_source_map` pre-compiled a source to read its `i.NAME`
 sections. It ran `subprocess.run(cmd)` with no `cwd`, so it inherited whatever
 directory the pipeline was invoked from. Ninja's `compile` rule runs from the
 project working directory, so a flag like `-Iinclude` resolves there — but
@@ -50,8 +50,9 @@ discovery did not, and every multi-function file failed to compile with
 `cannot open source input file "png.h"`. Files claimed by name never went
 through discovery, so nothing else in the pipeline noticed.
 
-Fixed: `compile_source` takes a `cwd`, and discovery passes the project
-working directory.
+Fixed: `compile_source` took a `cwd`, and discovery passed the project
+working directory. Discovery has since stopped compiling altogether: it reads
+the objects ninja's own `compile` rule builds, so the two cannot disagree.
 
 ### 2. A file named after one of its functions was never scanned
 

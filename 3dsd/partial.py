@@ -58,7 +58,7 @@ def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -
         raise PipelineError(f"No compilable source under {scope}.")
 
     _print(f"=== Compile ({len(selected)} file{'s' if len(selected) != 1 else ''}) ===")
-    objects = _compile(config, selected, jobs)
+    objects, failed = _compile(config, selected, jobs)
 
     out_dir = config.out_dir / PARTIAL_DIR
     units = []
@@ -106,7 +106,7 @@ def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -
 
     _print("=== Progress ===")
     report_progress(config, project_dir=out_dir, detail=True)
-    return all(o.stat().st_size > 0 for objs in objects.values() for o in objs)
+    return not failed
 
 
 def _within(path: Path, scope: Path) -> bool:
@@ -115,11 +115,11 @@ def _within(path: Path, scope: Path) -> bool:
 
 
 def _compile(config: ProjectConfig, selected: list[tuple[str, Path]],
-             jobs: int | None) -> dict[str, list[Path]]:
+             jobs: int | None) -> tuple[dict[str, list[Path]], int]:
     """Compile each selected source, printing all the compiler said about it.
 
-    Returns `{binary: [object]}` for those that compiled; a failed compile
-    leaves an empty object, which is left out.
+    Returns `{binary: [object]}` for those that compiled, and how many failed;
+    a failed compile leaves no object.
     """
     def one(bin_name: str, src: Path):
         key = config.src_key(bin_name, src)
@@ -127,18 +127,20 @@ def _compile(config: ProjectConfig, selected: list[tuple[str, Path]],
         obj = config.obj_path(bin_name, key)
         rel = src.resolve().relative_to(config.working_dir)
         returncode, text = compile_capture(rel, obj, cc_path, flags, config.working_dir)
-        return bin_name, obj, describe(rel, text, returncode)
+        return bin_name, obj, returncode, describe(rel, text, returncode)
 
     objects: dict[str, list[Path]] = {}
+    failed = 0
     workers = jobs or min(32, (os.cpu_count() or 4) * 2)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for bin_name, obj, report in pool.map(lambda job: one(*job), selected):
+        for bin_name, obj, returncode, report in pool.map(lambda job: one(*job), selected):
             _print(report)
-            if obj.exists() and obj.stat().st_size > 0:
-                objects.setdefault(bin_name, []).append(obj)
+            objects.setdefault(bin_name, [])
+            if returncode == 0:
+                objects[bin_name].append(obj)
             else:
-                objects.setdefault(bin_name, [])
-    return objects
+                failed += 1
+    return objects, failed
 
 
 def _missing_symbol(symbol: str, scope: Path, defined: list[str]) -> str:

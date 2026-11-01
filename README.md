@@ -316,6 +316,11 @@ line, its warnings counted rather than shown --
 `[12/3562] src/code.bin/foo.c: 2 warnings`, in orange -- and a file with
 errors prints the compiler's full output in red.
 
+A file that fails to compile fails the build, like any other ninja step;
+`objdiff.json` and the progress report are then left as the last successful
+build left them. Add `-k` to compile everything that can be compiled first, so
+every error shows in one run.
+
 ### Building part of a project
 
 Give `build` a directory or file inside the project instead of the project
@@ -417,9 +422,12 @@ data object it finds that the symbol CSV also names.
   literals and statics, which armcc refers to through their section, are
   matched by content instead. See `3dsd/reloc.py`.
 
-`3dsd ninja` compiles every source once to do this discovery (in parallel,
-cached in `build/`); on an 1,800-file project that is around 20 seconds cold
-and nothing at all once the objects are there.
+Ninja compiles every source exactly once, and `build.ninja` is itself rebuilt
+from the resulting objects: when any object changes, ninja reruns `3dsd ninja`
+to read which symbols each source now defines, then carries on with the new
+graph. Edits to headers recompile the sources that include them. Bare `ninja`
+works the same way, but it cannot see a source added or removed; `3dsd build`
+regenerates `build.ninja` for that, or run `python -m 3dsd ninja .`.
 
 See [docs/multi-function-sources.md](docs/multi-function-sources.md) for how
 the objdiff base ELF is assembled and why it needs its own linker script.

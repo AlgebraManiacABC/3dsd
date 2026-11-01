@@ -1,9 +1,18 @@
-"""build.ninja generation."""
+"""build.ninja generation.
 
+Every source gets a compile edge, and build.ninja is itself an output whose
+inputs are all of those objects: ninja brings its own manifest up to date
+before anything else, so it compiles whatever is stale, reruns `3dsd ninja`
+to read the symbols the objects define, and restarts on the new graph. Which
+source owns which symbol -- and so what the objdiff base links -- is decided
+from objects ninja built, and each source is compiled exactly once.
+"""
+
+import hashlib
 import sys
 from pathlib import Path
 
-from .config import ProjectConfig
+from .config import SYMBOLS_DIR, ProjectConfig
 from .ctrtype import CTRBinary
 from .util import Symbol, posix, sanitize
 
@@ -17,7 +26,14 @@ _RULES = [
     '',
     'rule compile',
     '  command = $tool compile --source $in --output $out --cc $cc_path $flags_arg',
+    '  depfile = $out.d',
+    '  deps = gcc',
     '  description = CC $desc',
+    '',
+    'rule regen',
+    '  command = $tool ninja . $regen_args',
+    '  generator = 1',
+    '  description = REGEN build.ninja',
     '',
     'rule link',
     '  command = $ld $ldflags @$out.rsp -o $out -Map $out.map',
@@ -109,25 +125,22 @@ class _NinjaWriter:
         config = self.config
         self.emit(f'# === {bin_name} ===', '')
 
-        source_map = config.get_source_map(bin_name)
-        names = list(_split_names(config.symbols.get(bin_name, []), len(binary.data)))
-
-        # One compile per source that claims at least one symbol, in the order
-        # its first symbol appears in the binary -- which is also the order the
-        # base ELF links them in.
-        compiled_objects: list[str] = []
-        emitted: set[str] = set()
-        for name in names:
-            if name not in source_map:
-                continue
-            src_path, src_key = source_map[name]
-            if src_key in emitted:
-                continue
-            emitted.add(src_key)
+        # Every source is compiled, whether or not it claims a symbol yet: its
+        # object is what says which symbols it defines.
+        sources = sorted((config.src_key(bin_name, src), src)
+                         for src in config.sources.get(bin_name, []))
+        for src_key, src_path in sources:
             build_o = self.rel(config.obj_path(bin_name, src_key))
-            compiled_objects.append(build_o)
             self.compile_targets.append(build_o)
             self._compile(bin_name, src_path, src_key, build_o)
+
+        # The base links each source that claims at least one symbol, in the
+        # order its first symbol appears in the binary.
+        source_map = config.get_source_map(bin_name)
+        names = list(_split_names(config.symbols.get(bin_name, []), len(binary.data)))
+        compiled_objects = list(dict.fromkeys(
+            self.rel(config.obj_path(bin_name, source_map[name][1]))
+            for name in names if name in source_map))
 
         # The objdiff base ELF is the progress path: compiled objects only.
         if compiled_objects:
@@ -193,6 +206,17 @@ class _NinjaWriter:
                   '')
         self.default_targets.append(stamp)
 
+    def regen(self, regen_args: str):
+        """build.ninja, rebuilt from every object and the project's settings."""
+        config = self.config
+        inputs = [config.working_dir / 'cc.yaml', *config.originals,
+                  *(f for f in (config.working_dir / SYMBOLS_DIR).iterdir() if f.is_file()),
+                  *sorted(_PACKAGE_DIR.glob('*.py')), _BASE_LD, _LINKER_LD]
+        self.emit(f'build build.ninja: regen {_escape_all(self.compile_targets)}'
+                  f' | {_escape_all([self.rel(p) for p in inputs])}',
+                  f'  regen_args = {regen_args}',
+                  '')
+
     def phonies(self):
         """The `compile` and `objdiff` aliases and the default targets."""
         if self.compile_targets:
@@ -203,6 +227,31 @@ class _NinjaWriter:
             self.emit(f'default {_escape_all(self.default_targets)}', '')
 
 
+def manifest_header(config: ProjectConfig, roundtrip: bool) -> str:
+    """The line identifying what a build.ninja was generated for.
+
+    `3dsd build` regenerates only when this differs: ninja keeps the manifest
+    current as objects change, but cannot see a source added or removed, a
+    different mode, or a manifest written by an older 3dsd.
+    """
+    files = sorted(f'{b}/{config.src_key(b, s)}'
+                   for b, srcs in config.sources.items() for s in srcs)
+    digest = hashlib.sha1('\n'.join(files).encode()).hexdigest()[:16]
+    return (f'# 3dsd manifest v2 roundtrip={int(roundtrip)} '
+            f'binary={config.single_binary or "*"} sources={digest}')
+
+
+def manifest_is_current(config: ProjectConfig, roundtrip: bool) -> bool:
+    """Whether build.ninja exists and was generated for this project state."""
+    try:
+        path = config.working_dir / 'build.ninja'
+        with path.open(encoding='utf-8', errors='replace') as f:
+            f.readline()
+            return f.readline().rstrip('\n') == manifest_header(config, roundtrip)
+    except OSError:
+        return False
+
+
 def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
     """Generate build.ninja for the project.
 
@@ -210,6 +259,9 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
     compiled to its own object, and those objects linked into the objdiff base
     ELF. The objdiff target is built from the original binary and the symbol
     CSV, so nothing in the progress path needs the split.
+
+    Objects not compiled yet contribute no symbols; build.ninja depends on
+    them, so ninja compiles them and regenerates it before linking anything.
 
     `roundtrip` adds the byte-perfect rebuild on top: every split object
     linked back together, flattened (or rebuilt as a CRO), and hashed against
@@ -221,20 +273,21 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
     pipeline_dir = _PACKAGE_DIR.parent.resolve()
     python = posix(Path(sys.executable).resolve())
 
-    # '3dsd' is not a valid Python identifier, so the wrapper loads the
-    # package via importlib instead of an import statement.
-    wrapper = config.build_dir / '_3dsd_wrapper.py'
-    wrapper.parent.mkdir(parents=True, exist_ok=True)
-    wrapper.write_text(
-        f"import sys, importlib; sys.path.insert(0, {str(pipeline_dir)!r}); "
-        f"importlib.import_module('3dsd.__main__').main()\n"
-    )
-    tool_cmd = f'"{python}" "{posix(wrapper.resolve())}"'
+    # '3dsd' is not a valid Python identifier, so the package is loaded via
+    # importlib instead of `-m`, which would also need it on sys.path.
+    loader = (f"import sys, importlib; sys.path.insert(0, {posix(pipeline_dir)!r}); "
+              f"importlib.import_module('3dsd.__main__').main()")
+    tool_cmd = f'"{python}" -c "{loader}"'
 
     (config.out_dir / 'objdiff_base').mkdir(parents=True, exist_ok=True)
 
+    regen_args = ' '.join(
+        (['--roundtrip'] if roundtrip else [])
+        + ([f'--single-binary "{config.single_binary}"'] if config.single_binary else []))
+
     out = _NinjaWriter(config, roundtrip)
     out.emit('# Generated by 3dsd ninja — do not edit',
+             manifest_header(config, roundtrip),
              'ninja_required_version = 1.3',
              '',
              f'ld = {posix(config.ld_path().resolve())}',
@@ -245,10 +298,9 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
              *_RULES)
     for bin_name, binary in config.binaries.items():
         out.binary(bin_name, binary)
+    out.regen(regen_args)
     out.phonies()
 
-    ninja_path.write_text('\n'.join(out.lines))
-    print(f"Generated {ninja_path}")
+    ninja_path.write_text('\n'.join(out.lines) + '\n', encoding='utf-8')
     mode = 'progress + byte-perfect round-trip' if roundtrip else 'decomp progress'
-    print(f"  Targets: {mode}.")
-    print("  Run 'ninja' to build, or 'ninja compile' to compile only.")
+    print(f"Generated {ninja_path.name} ({mode}).")

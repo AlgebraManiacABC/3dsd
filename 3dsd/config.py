@@ -3,16 +3,14 @@
 import contextlib
 import csv
 import fnmatch
-import json
 import os
 import re
 import subprocess
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
 
-from .compiler import SymbolInfo, compile_source, discover_symbols
+from .compiler import SymbolInfo, discover_symbols
 from .ctrtype import CRO, CTRBinary, ExHeader
 from .util import BinaryReader, PipelineError, Symbol, sanitize
 
@@ -100,6 +98,8 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
         self.cc_info = cc_info
         self.compilers = compilers or {}
         self.deps = deps or {}
+        # The binary `--single-binary` narrowed the project to, if any.
+        self.single_binary: str | None = None
         self._verified_ccs: set[str] = set()
         # {binary: {src_key: {symbol: SymbolInfo}}}, one parse per object.
         self._symbol_info: dict[str, dict[str, dict[str, SymbolInfo]]] = {}
@@ -110,7 +110,7 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
         # Anchor the project absolutely before deriving anything from it. Two
         # different relative bases otherwise collide: paths built here are
         # relative to the caller's cwd, but the compile runs with cwd set to
-        # the project (ninja's own directory, matched by section discovery so
+        # the project (ninja's own directory, which partial builds match so
         # `-Iinclude` resolves the same way). A relative `3dsd build
         # versions/X` therefore handed subprocess a compiler path that only
         # existed one directory up -- ENOENT on a file the pipeline had just
@@ -151,6 +151,7 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
                      build_dir, split_dir, link_dir, out_dir, tool_dir, symbols,
                      cc_info, compilers, deps)
         config.markers = markers
+        config.single_binary = single_binary
         return config
 
     def src_key(self, binary_name: str, path: Path) -> str:
@@ -285,7 +286,7 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
     def get_decompiled_data(self, bin_name: str) -> dict[str, str]:
         """Map data objects this project's sources define to their section.
 
-        Read from the same cached discovery objects `get_source_map` uses, so
+        Read from the same cached objects `get_source_map` uses, so
         it costs nothing extra; it just keeps the data symbols the walk turns
         up alongside the functions, which `base.ld` routes away from .text.
 
@@ -302,13 +303,17 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
                     found[sanitize(name)] = info.segment
         return found
 
+    def forget_objects(self):
+        """Drop the symbols read from objects, so the next use rereads them."""
+        self._symbol_info.clear()
+
     def _discovered_symbols(self, bin_name: str) -> dict[str, dict[str, SymbolInfo]]:
         """`{src_key: {symbol: SymbolInfo}}` for every object already compiled.
 
         Cached because `get_source_map` and `get_decompiled_data` both want it
-        and each object is worth parsing once per run. Objects that do not
-        exist yet are simply absent: this never compiles anything, it only
-        reads what the discovery pass in `get_source_map` has already built.
+        and each object is worth parsing once per run. This never compiles:
+        ninja does, and regenerates build.ninja whenever an object changes. An
+        object not built yet, or whose compile failed, is simply absent.
         """
         cached = self._symbol_info.get(bin_name)
         if cached is not None:
@@ -317,70 +322,27 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
         for src in self.sources.get(bin_name, []):
             key = self.src_key(bin_name, src)
             build_o = self.obj_path(bin_name, key)
+            # Empty: a failed compile from before failures removed the object.
             if build_o.exists() and build_o.stat().st_size > 0:
                 cached[key] = discover_symbols(build_o)
         self._symbol_info[bin_name] = cached
         return cached
 
-    def _refresh_discovery(self, bin_name: str, sources: dict[str, Path]):
-        """Compile every source whose discovery object is missing or stale.
-
-        The discovery object is also keyed on the compiler and flags: editing
-        cc.yaml must invalidate it, or section discovery silently runs against
-        an object built with the previous settings.
-        """
-        manifest_path = self.build_dir / bin_name / '.discovery.json'
-        try:
-            manifest = json.loads(manifest_path.read_text())
-        except (OSError, ValueError):
-            manifest = {}
-
-        stale: list[tuple[str, Path, Path, Path, list[str], str]] = []
-        for key, src_path in sources.items():
-            build_o = self.obj_path(bin_name, key)
-            cc_path, flags = self.get_cc(bin_name, key)
-            cc_key = f'{cc_path}|{",".join(flags)}'
-            if (not build_o.exists()
-                    or build_o.stat().st_size == 0
-                    or src_path.stat().st_mtime > build_o.stat().st_mtime
-                    or manifest.get(key) != cc_key):
-                stale.append((key, src_path, build_o, cc_path, flags, cc_key))
-
-        if not stale:
-            return
-        print(f"  Scanning {len(stale)} source file(s) for symbols...")
-        with ThreadPoolExecutor(max_workers=_scan_workers()) as pool:
-            futures = [pool.submit(compile_source, src_path, build_o, cc_path, flags,
-                                   self.working_dir)
-                       for _key, src_path, build_o, cc_path, flags, _cc_key in stale]
-            for f in futures:
-                f.result()
-        for key, *_rest, cc_key in stale:
-            manifest[key] = cc_key
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps(manifest, indent=1))
-
     def get_source_map(self, bin_name: str) -> dict[str, tuple[Path, str]]:
         """Return {sym_name: (source_path, src_key)} for every symbol a source
         provides.
 
-        Every source is compiled once and its symbol table read, so a symbol is
-        claimed no matter whether it sits alone in a file named after it, among
-        a hundred others in one translation unit, or in a C++ file under a
-        mangled name. Objects are cached in `build/`; only a missing, stale or
-        differently-configured object is recompiled.
+        Read from the objects ninja compiled, so a symbol is claimed no matter
+        whether it sits alone in a file named after it, among a hundred others
+        in one translation unit, or in a C++ file under a mangled name.
         """
         sources = {self.src_key(bin_name, s): s
                    for s in self.sources.get(bin_name, [])}
         all_syms = {sanitize(sym.name) for sym in self.symbols.get(bin_name, [])
                     if sym.addr >= 0}
 
-        self._refresh_discovery(bin_name, sources)
-
-        # Objects have just been brought up to date, so this is the parse.
-        # Anything absent from it failed to compile: the file can still claim
-        # the symbol it is named after below, so the symbol stays in the build
-        # and simply reads as unmatched.
+        # A source without an object yet can still claim the symbol it is
+        # named after below; ninja compiles it before the link either way.
         symbols_by_key = self._discovered_symbols(bin_name)
 
         discovered: dict[str, list[str]] = {}
@@ -393,8 +355,7 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
             # a fraction of a shared library, and plenty of it compiles away
             # entirely behind #ifdefs. Only the project's own sources are
             # worth warning about; dependencies get a summary instead.
-            build_o = self.obj_path(bin_name, key)
-            if (not info and build_o.exists() and build_o.stat().st_size > 0
+            if (not info and key in symbols_by_key
                     and sanitize(sources[key].stem) not in all_syms
                     and not key.startswith(f'{DEP_PREFIX}/')):
                 print(f"  Warning: {key} defines no symbols.")
@@ -677,11 +638,6 @@ def _install_cc(cc_name: str, install: Path, flags: list[str]) -> Path:
     if include.is_dir():
         flags.append(f'-I{include.as_posix()}')
     return cc
-
-
-def _scan_workers() -> int:
-    """Parallelism for the symbol-discovery compiles."""
-    return min(32, (os.cpu_count() or 4) * 2)
 
 
 def _check_dirs(working_dir: Path, orig_dir: Path, tool_dir: Path,

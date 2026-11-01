@@ -128,12 +128,14 @@ def _run(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-st
             report_progress(_load(args))
         case 'compile':
             from .compiler import compile_source
-            compile_source(
+            returncode = compile_source(
                 source=Path(args.source),
                 output=Path(args.output),
                 cc=Path(args.cc_path),
                 flags=args.flags.split(',') if args.flags else [],
+                depfile=Path(args.output + '.d'),
             )
+            return 0 if returncode == 0 else 1
         case 'link-base':
             from .objdiff import link_base
             return link_base(Path(args.ld), Path(args.output), Path(args.rsp))
