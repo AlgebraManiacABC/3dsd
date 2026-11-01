@@ -12,7 +12,7 @@ import yaml
 
 from .compiler import SymbolInfo, discover_symbols
 from .ctrtype import CRO, CTRBinary, ExHeader
-from .util import BinaryReader, PipelineError, Symbol, sanitize, warn
+from .util import BinaryReader, PipelineError, Symbol, listing, sanitize, warn
 
 # Generated directory names, relative to the project working directory.
 # Shared with clean.py so the two cannot drift apart.
@@ -510,11 +510,7 @@ def _apply_exheader_segments(sym_path: Path, symbols: list[Symbol],
             sym.segment = real
     if changed:
         warn(f"{len(changed)} segment label(s) in {sym_path.name} disagree "
-             f"with the exheader; using the exheader:")
-        for line in changed[:10]:
-            print(f"    {line}")
-        if len(changed) > 10:
-            print(f"    ... and {len(changed) - 10} more")
+             f"with the exheader; using the exheader:", listing(changed, '    ', 10))
 
 
 def _load_deps(dep_info: dict | None, working_dir: Path) -> dict[str, Dependency]:

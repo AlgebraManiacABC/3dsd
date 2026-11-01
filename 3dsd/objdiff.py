@@ -17,7 +17,7 @@ from .ctrtype import CRO, CTRBinary
 from .datasplit import POOL_SEGMENT, pool_section, split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
 from .reloc import BaseObject, RelocRecovery, read_base
-from .util import Symbol, posix, sanitize, warn
+from .util import Symbol, listing, posix, sanitize, warn
 
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _STD_OUTPUT_HANDLE = -11
@@ -351,11 +351,8 @@ def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylin
                                    end - mark.addr, mark.segment, mark.namespace))
     if overruns:
         warn(f"{name}: {len(overruns):,} mapping row(s) whose Size runs past the "
-             f"next marker or symbol; cut short there:")
-        for line in overruns[:5]:
-            print(f"    {line}")
-        if len(overruns) > 5:
-            print(f"    ... and {len(overruns) - 5:,} more")
+             f"next marker or symbol; cut short there:",
+             listing(overruns, '    '))
     return csv + trailing, out
 
 
@@ -429,11 +426,8 @@ def _warn_unmarked(name: str, syms: list[Symbol], base: BaseObject, marked: set[
     if not missing:
         return
     warn(f"{name}: {len(missing):,} decompiled function(s) hold data (a "
-         f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:")
-    for sym in missing[:5]:
-        print(f"    {base_addr + sym.addr:08x} {sym.name}")
-    if len(missing) > 5:
-        print(f"    ... and {len(missing) - 5:,} more")
+         f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:",
+         listing([f"{base_addr + sym.addr:08x} {sym.name}" for sym in missing], '    '))
 
 
 def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[str]):
@@ -453,22 +447,21 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
     code = [p for p in pads if p.segment == '.text']
     code_bytes = sum(p.size for p in code)
     data_bytes = sum(p.size for p in pads) - code_bytes
-    warn(f"{name}: {len(pads):,} region(s) the symbol CSV does not name "
-         f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
-         f"Label them as $a/$t/$d in the CSV.")
     previous = {}
     for before, sym in itertools.pairwise(syms):
         previous[sym.addr] = before
     after_compiled = [p for p in code
                       if previous.get(p.addr) is not None and previous[p.addr].name in compiled]
+    details = []
     if after_compiled:
-        print(f"    {len(after_compiled):,} directly follow a decompiled function "
-              f"(likely its literal pool, left uncompared):")
-        for pad in after_compiled[:5]:
-            print(f"      {base_addr + pad.addr:08x} +{pad.size:<5} after "
-                  f"{previous[pad.addr].name}")
-        if len(after_compiled) > 5:
-            print(f"      ... and {len(after_compiled) - 5:,} more")
+        details = [(f"    {len(after_compiled):,} directly follow a decompiled function "
+                    f"(likely its literal pool, left uncompared):"),
+                   *listing([f"{base_addr + pad.addr:08x} +{pad.size:<5} after "
+                              f"{previous[pad.addr].name}" for pad in after_compiled],
+                             '      ')]
+    warn(f"{name}: {len(pads):,} region(s) the symbol CSV does not name "
+         f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
+         f"Label them as $a/$t/$d in the CSV.", details)
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disable=too-many-arguments,too-many-positional-arguments

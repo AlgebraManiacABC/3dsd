@@ -23,14 +23,24 @@ def use_color() -> bool:
     return bool(os.environ.get('CLICOLOR_FORCE')) or sys.stdout.isatty()
 
 
-def warn(message: str):
-    """Print an indented `Warning:` line, in orange where colour is on.
+def listing(items: list[str], indent: str, limit: int = 5) -> list[str]:
+    """The first `limit` of `items`, indented, and a count of the rest."""
+    lines = [f"{indent}{item}" for item in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"{indent}... and {len(items) - limit:,} more")
+    return lines
 
-    Only the headline is coloured; any detail lines a caller prints after it
-    stay plain, as a compile's warning tally does.
+
+def warn(message: str, details: list[str] | tuple[str, ...] = ()):
+    """Print an indented `Warning:` line and its detail lines.
+
+    The whole block is orange where colour is on. `details` are printed as
+    given, so they carry their own indentation.
     """
-    text = f'Warning: {message}'
-    print(f'  {ORANGE}{text}{RESET}' if use_color() else f'  {text}')
+    lines = [f'  Warning: {message}', *details]
+    if use_color():
+        lines = [f'{ORANGE}{line}{RESET}' for line in lines]
+    print('\n'.join(lines))
 
 
 class PipelineError(Exception):
