@@ -17,7 +17,7 @@ from .ctrtype import CRO, CTRBinary
 from .datasplit import POOL_SEGMENT, pool_section, split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
 from .reloc import BaseObject, RelocRecovery, read_base
-from .util import Symbol, posix, sanitize
+from .util import Symbol, posix, sanitize, warn
 
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _STD_OUTPUT_HANDLE = -11
@@ -249,7 +249,7 @@ def build_target(config: ProjectConfig, name: str,  # pylint: disable=too-many-a
     if scope is not None:
         syms = _apply_scope(syms, scope)
     data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms, marks,
-                                                      warn=scope is None)
+                                                      check_marks=scope is None)
     out.parent.mkdir(parents=True, exist_ok=True)
     write_target_elf(out, data, syms, relocs, marks.mapping + mapping)
     if scope is None:
@@ -350,8 +350,8 @@ def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylin
             trailing.append(Symbol(mark.addr, f'pool_{base_addr + mark.addr:08x}', '$d',
                                    end - mark.addr, mark.segment, mark.namespace))
     if overruns:
-        print(f"  Warning: {name}: {len(overruns):,} mapping row(s) whose Size runs past the "
-              f"next marker or symbol; cut short there:")
+        warn(f"{name}: {len(overruns):,} mapping row(s) whose Size runs past the "
+             f"next marker or symbol; cut short there:")
         for line in overruns[:5]:
             print(f"    {line}")
         if len(overruns) > 5:
@@ -428,8 +428,8 @@ def _warn_unmarked(name: str, syms: list[Symbol], base: BaseObject, marked: set[
                                       and base.has_inner_data(twin)))]
     if not missing:
         return
-    print(f"  Warning: {name}: {len(missing):,} decompiled function(s) hold data (a "
-          f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:")
+    warn(f"{name}: {len(missing):,} decompiled function(s) hold data (a "
+         f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:")
     for sym in missing[:5]:
         print(f"    {base_addr + sym.addr:08x} {sym.name}")
     if len(missing) > 5:
@@ -453,9 +453,9 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
     code = [p for p in pads if p.segment == '.text']
     code_bytes = sum(p.size for p in code)
     data_bytes = sum(p.size for p in pads) - code_bytes
-    print(f"  Warning: {name}: {len(pads):,} region(s) the symbol CSV does not name "
-          f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
-          f"Label them as $a/$t/$d in the CSV.")
+    warn(f"{name}: {len(pads):,} region(s) the symbol CSV does not name "
+         f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
+         f"Label them as $a/$t/$d in the CSV.")
     previous = {}
     for before, sym in itertools.pairwise(syms):
         previous[sym.addr] = before
@@ -472,7 +472,8 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers", warn: bool = True):
+                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers",
+                    check_marks: bool = True):
     """`(data, relocs, mapping, note)`: the target's bytes, relocations and
     literal-pool mapping symbols, recovered against its base."""
     if base is None:
@@ -483,7 +484,7 @@ def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disab
                              pointers=not isinstance(binary.binary, CRO))
     recovery.marked = marks.functions
     data, relocs = recovery.run(syms)
-    if warn:
+    if check_marks:
         _warn_unmarked(binary.name, syms, base, marks.functions, binary.base_addr)
     note = f", {len(relocs):,} relocations"
     if recovery.unresolved:
@@ -503,9 +504,9 @@ def generate_objdiff(config: ProjectConfig):
         target_path = _rel(config.out_dir / 'objdiff_target' / name, config.working_dir)
         base_elf = config.out_dir / 'objdiff_base' / name
         if not base_elf.exists() and config.sources.get(name):
-            print(f"  Warning: no base ELF for {name}: the objdiff base link "
-                  f"has not run or failed. Progress will read as 0%; run "
-                  f"'ninja objdiff' and check the LINK_BASE output.")
+            warn(f"no base ELF for {name}: the objdiff base link "
+                 f"has not run or failed. Progress will read as 0%; run "
+                 f"'ninja objdiff' and check the LINK_BASE output.")
         base_path = _rel(base_elf, config.working_dir) if base_elf.exists() else None
         units.append((name, posix(target_path), posix(base_path) if base_path else None))
     out_path = config.working_dir / 'objdiff.json'

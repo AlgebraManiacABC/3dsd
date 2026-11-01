@@ -1,11 +1,36 @@
 """Shared primitives: binary I/O, symbols, relocations and small helpers."""
 
+import os
 import re
 import struct
+import sys
 from enum import IntEnum
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
+
+#: ANSI colours: red for errors, orange for warnings.
+RED = '\x1b[31m'
+ORANGE = '\x1b[38;5;208m'
+RESET = '\x1b[0m'
+
+
+def use_color() -> bool:
+    """Colour unless NO_COLOR; forced under `3dsd build`, which reads ninja's
+    output through a pipe and sets CLICOLOR_FORCE so the escapes survive."""
+    if os.environ.get('NO_COLOR'):
+        return False
+    return bool(os.environ.get('CLICOLOR_FORCE')) or sys.stdout.isatty()
+
+
+def warn(message: str):
+    """Print an indented `Warning:` line, in orange where colour is on.
+
+    Only the headline is coloured; any detail lines a caller prints after it
+    stay plain, as a compile's warning tally does.
+    """
+    text = f'Warning: {message}'
+    print(f'  {ORANGE}{text}{RESET}' if use_color() else f'  {text}')
 
 
 class PipelineError(Exception):

@@ -12,7 +12,7 @@ import yaml
 
 from .compiler import SymbolInfo, discover_symbols
 from .ctrtype import CRO, CTRBinary, ExHeader
-from .util import BinaryReader, PipelineError, Symbol, sanitize
+from .util import BinaryReader, PipelineError, Symbol, sanitize, warn
 
 # Generated directory names, relative to the project working directory.
 # Shared with clean.py so the two cannot drift apart.
@@ -354,7 +354,7 @@ class ProjectConfig:  # pylint: disable=too-many-instance-attributes
             if (not info and key in symbols_by_key
                     and sanitize(sources[key].stem) not in all_syms
                     and not key.startswith(f'{DEP_PREFIX}/')):
-                print(f"  Warning: {key} defines no symbols.")
+                warn(f"{key} defines no symbols.")
 
         owner = _assign_owners(sources, discovered, vague_by_key, all_syms)
         vendored = sorted(k for k in sources if k.startswith(f'{DEP_PREFIX}/'))
@@ -417,8 +417,8 @@ def _assign_owners(sources: dict[str, Path], discovered: dict[str, list[str]],
         if sym in vague_by_key.get(key, ()) and sym in vague_by_key.get(owner[sym], ()):
             folded.append(sym)
             return
-        print(f"  Warning: {sym} is defined by both {owner[sym]} "
-              f"and {key}; keeping {owner[sym]}.")
+        warn(f"{sym} is defined by both {owner[sym]} "
+             f"and {key}; keeping {owner[sym]}.")
 
     own = sorted(k for k in sources if not k.startswith(f'{DEP_PREFIX}/'))
     vendored = sorted(k for k in sources if k.startswith(f'{DEP_PREFIX}/'))
@@ -509,8 +509,8 @@ def _apply_exheader_segments(sym_path: Path, symbols: list[Symbol],
             changed.append(f"{sym.name} at {sym.addr:08x}: {sym.segment} -> {real}")
             sym.segment = real
     if changed:
-        print(f"  Warning: {len(changed)} segment label(s) in {sym_path.name} disagree "
-              f"with the exheader; using the exheader:")
+        warn(f"{len(changed)} segment label(s) in {sym_path.name} disagree "
+             f"with the exheader; using the exheader:")
         for line in changed[:10]:
             print(f"    {line}")
         if len(changed) > 10:
