@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .elf import ELFHeader, SectionHeaderFlags, SectionHeaderType
-from .util import ORANGE, RED, RESET, BinaryReader, get_name, use_color
+from .util import ORANGE, RED, RESET, BinaryReader, get_name, listing, use_color, warn
 
 _GRP_COMDAT = 0x1
 _STT_OBJECT = 1
@@ -50,26 +50,48 @@ def compile_capture(source: Path, output: Path, cc: Path, flags: list[str],
         # Written even if armcc wrote nothing: ninja fails a step whose
         # depfile is missing.
         armdep = raw_dep.read_text(errors='replace') if raw_dep.exists() else ''
-        depfile.write_text(_ninja_depfile(output, armdep))
+        depfile.write_text(_ninja_depfile(output, armdep, cwd or Path.cwd()))
     raw_dep.unlink(missing_ok=True)
     return result.returncode, result.stdout
 
 
-def _ninja_depfile(output: Path, armdep: str) -> str:
+def _ninja_depfile(output: Path, armdep: str, cwd: Path) -> str:
     """armcc's `--depend` output rewritten as one Makefile rule ninja can read.
 
     armcc writes one `target: dependency` line per file, quoting or escaping
     spaces depending on `--depend_format`; each path is taken whole after the
     first `: ` (a drive letter's colon has no space after it) and re-escaped.
+
+    Only files that exist are kept. Ninja treats a dependency it cannot find
+    as changed on every run, and every object is an input of build.ninja, so
+    one such path makes ninja regenerate build.ninja and recompile that
+    object forever. armcc run under wibo on Linux sees the filesystem as
+    drive Z: and names a header it found by an absolute path -- the
+    toolchain's own `<list>` and friends -- as `Z:\\deps\\...`. wibo maps
+    such a path back by dropping a `Z:` or `C:` drive, so that is done here
+    too; anything still missing is dropped with a warning.
     """
-    deps = []
+    deps, missing = [], []
     for line in armdep.splitlines():
         _target, sep, dep = line.partition(': ')
-        dep = dep.strip().strip('"').replace('\\ ', ' ')
-        if sep and dep:
-            deps.append(dep.replace('\\', '/'))
+        dep = dep.strip().strip('"').replace('\\ ', ' ').replace('\\', '/')
+        if not (sep and dep):
+            continue
+        if os.name != 'nt' and _DRIVE.match(dep) and not (cwd / dep).exists():
+            dep = dep[2:]
+        if (cwd / dep).exists():
+            deps.append(dep)
+        else:
+            missing.append(dep)
+    if missing:
+        warn(f"{output.name}: {len(missing):,} header path(s) armcc reported do not exist; "
+             f"not tracked, so editing them will not rebuild it:", listing(missing, '    '))
     escaped = (d.replace('$', '$$').replace('#', '\\#').replace(' ', '\\ ') for d in deps)
     return f"{output.as_posix()}: {' '.join(escaped)}\n"
+
+
+#: A Windows drive prefix, `Z:/`.
+_DRIVE = re.compile(r'^[A-Za-z]:/')
 
 
 def describe(source: Path, text: str, returncode: int) -> str:
