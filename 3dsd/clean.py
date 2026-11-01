@@ -76,7 +76,7 @@ def run_clean(working_dir: Path, targets: list[str], dry_run: bool = False) -> b
     if 'split' in selected:
         print("  Note: split output removed — the next build will re-split "
               "the originals, which takes several minutes.")
-    if not dry_run and ('build' in selected or 'ninja' in selected):
+    if not dry_run and 'ninja' in selected:
         print("  Note: run '3dsd ninja .' (or any '3dsd build .') before "
               "invoking ninja directly.")
 

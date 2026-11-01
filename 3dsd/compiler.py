@@ -17,33 +17,60 @@ _SHN_LORESERVE = 0xFF00
 
 
 def compile_source(source: Path, output: Path, cc: Path, flags: list[str],
-                   cwd: Path | None = None):
-    """Compile a translation unit. Writes an empty file on failure so the
-    build can continue; the file then simply claims nothing.
+                   depfile: Path | None = None) -> int:
+    """Compile a translation unit as ninja's `compile` rule does; armcc's exit code.
 
-    `cwd` must be the project working directory whenever the flags contain
-    project-relative paths (`-Iinclude`): ninja runs the compile rule from
-    there, and section discovery has to use the same directory or the
-    include search fails."""
-    returncode, text = compile_capture(source, output, cc, flags, cwd)
+    Prints nothing, one warning tally, or the errors in full (`summarize`).
+    A failure leaves no object behind, so ninja fails the step and runs it
+    again next time rather than linking something stale."""
+    returncode, text = compile_capture(source, output, cc, flags, depfile=depfile)
     report = summarize(source, text, returncode)
     if report:
         print(report, flush=True)
+    return returncode
 
 
 def compile_capture(source: Path, output: Path, cc: Path, flags: list[str],
-                    cwd: Path | None = None) -> tuple[int, str]:
+                    cwd: Path | None = None,
+                    depfile: Path | None = None) -> tuple[int, str]:
     """Compile a translation unit; `(returncode, everything armcc printed)`.
 
-    Writes an empty object on failure, as `compile_source` does."""
+    On failure the object is removed. With `depfile`, the headers the source
+    included are written there for ninja (`deps = gcc`)."""
     output.parent.mkdir(parents=True, exist_ok=True)
     cmd = [str(cc), *flags, '-c', str(source), '-o', str(output)]
+    raw_dep = output.with_name(output.name + '.armdep')
+    if depfile is not None:
+        cmd.append(f'--depend={raw_dep}')
     result = subprocess.run(cmd, cwd=cwd, env=_cc_env(cc), check=False,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, errors='replace')
     if result.returncode != 0:
-        output.write_bytes(b'')
+        output.unlink(missing_ok=True)
+    elif depfile is not None:
+        # Written even if armcc wrote nothing: ninja fails a step whose
+        # depfile is missing.
+        armdep = raw_dep.read_text(errors='replace') if raw_dep.exists() else ''
+        depfile.write_text(_ninja_depfile(output, armdep))
+    raw_dep.unlink(missing_ok=True)
     return result.returncode, result.stdout
+
+
+def _ninja_depfile(output: Path, armdep: str) -> str:
+    """armcc's `--depend` output rewritten as one Makefile rule ninja can read.
+
+    armcc writes one `target: dependency` line per file, quoting or escaping
+    spaces depending on `--depend_format`; each path is taken whole after the
+    first `: ` (a drive letter's colon has no space after it) and re-escaped.
+    """
+    deps = []
+    for line in armdep.splitlines():
+        _target, sep, dep = line.partition(': ')
+        dep = dep.strip().strip('"').replace('\\ ', ' ')
+        if sep and dep:
+            deps.append(dep.replace('\\', '/'))
+    escaped = (d.replace('$', '$$').replace('#', '\\#').replace(' ', '\\ ') for d in deps)
+    return f"{output.as_posix()}: {' '.join(escaped)}\n"
 
 
 def describe(source: Path, text: str, returncode: int) -> str:
