@@ -1,11 +1,46 @@
 """Shared primitives: binary I/O, symbols, relocations and small helpers."""
 
+import os
 import re
 import struct
+import sys
 from enum import IntEnum
 from io import BytesIO
 from pathlib import Path
 from typing import Protocol
+
+#: ANSI colours: red for errors, orange for warnings.
+RED = '\x1b[31m'
+ORANGE = '\x1b[38;5;208m'
+RESET = '\x1b[0m'
+
+
+def use_color() -> bool:
+    """Colour unless NO_COLOR; forced under `3dsd build`, which reads ninja's
+    output through a pipe and sets CLICOLOR_FORCE so the escapes survive."""
+    if os.environ.get('NO_COLOR'):
+        return False
+    return bool(os.environ.get('CLICOLOR_FORCE')) or sys.stdout.isatty()
+
+
+def listing(items: list[str], indent: str, limit: int = 5) -> list[str]:
+    """The first `limit` of `items`, indented, and a count of the rest."""
+    lines = [f"{indent}{item}" for item in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"{indent}... and {len(items) - limit:,} more")
+    return lines
+
+
+def warn(message: str, details: list[str] | tuple[str, ...] = ()):
+    """Print an indented `Warning:` line and its detail lines.
+
+    The whole block is orange where colour is on. `details` are printed as
+    given, so they carry their own indentation.
+    """
+    lines = [f'  Warning: {message}', *details]
+    if use_color():
+        lines = [f'{ORANGE}{line}{RESET}' for line in lines]
+    print('\n'.join(lines))
 
 
 class PipelineError(Exception):

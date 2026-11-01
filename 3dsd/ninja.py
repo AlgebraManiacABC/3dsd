@@ -56,6 +56,18 @@ _RULES = [
     '  rspfile_content = $in_newline',
     '  description = LINK_BASE $out',
     '',
+    'rule objdiff_target',
+    '  command = $tool objdiff-target . --binary $binary --output $out',
+    '  description = TARGET $binary',
+    '',
+    'rule objdiff_json',
+    '  command = $tool objdiff-json --output $out $units',
+    '  description = OBJDIFF $out',
+    '',
+    'rule report',
+    '  command = $tool report --tools tools --output $out',
+    '  description = REPORT $out',
+    '',
     'rule verify',
     '  command = $tool check-file --original $original --built $in --stamp $out',
     '  description = VERIFY $desc',
@@ -109,6 +121,8 @@ class _NinjaWriter:
         self.default_targets: list[str] = []
         self.compile_targets: list[str] = []
         self.base_elf_targets: list[str] = []
+        #: `(binary, target ELF, base ELF or None)` for objdiff.json.
+        self.units: list[tuple[str, str, str | None]] = []
 
     def rel(self, p: Path) -> str:
         """Make a path relative to working_dir for the ninja file."""
@@ -116,6 +130,14 @@ class _NinjaWriter:
             return posix(p.relative_to(self.config.working_dir))
         except ValueError:
             return posix(p)
+
+    def config_inputs(self) -> list[str]:
+        """The project settings and pipeline code everything generated reads."""
+        config = self.config
+        inputs = [config.working_dir / 'cc.yaml', *config.originals,
+                  *(f for f in (config.working_dir / SYMBOLS_DIR).iterdir() if f.is_file()),
+                  *sorted(_PACKAGE_DIR.glob('*.py'))]
+        return [self.rel(p) for p in inputs]
 
     def emit(self, *lines: str):
         self.lines.extend(lines)
@@ -129,10 +151,12 @@ class _NinjaWriter:
         # object is what says which symbols it defines.
         sources = sorted((config.src_key(bin_name, src), src)
                          for src in config.sources.get(bin_name, []))
+        bin_objects = []
         for src_key, src_path in sources:
             build_o = self.rel(config.obj_path(bin_name, src_key))
-            self.compile_targets.append(build_o)
+            bin_objects.append(build_o)
             self._compile(bin_name, src_path, src_key, build_o)
+        self.compile_targets.extend(bin_objects)
 
         # The base links each source that claims at least one symbol, in the
         # order its first symbol appears in the binary.
@@ -154,7 +178,19 @@ class _NinjaWriter:
                       f'{_escape_all(compiled_objects)} | {_escape_ninja(_BASE_LD.as_posix())}',
                       '')
             self.base_elf_targets.append(base_elf)
-            self.default_targets.append(base_elf)
+        else:
+            base_elf = None
+
+        # The target ELF takes its relocations from the base and its data
+        # symbols from every object (`get_decompiled_data`), not only those
+        # the base links.
+        target_elf = self.rel(config.out_dir / 'objdiff_target' / bin_name)
+        explicit = [base_elf] if base_elf else []
+        self.emit(f'build {_escape_ninja(target_elf)}: objdiff_target {_escape_all(explicit)}'
+                  f' | {_escape_all(bin_objects + self.config_inputs())}',
+                  f'  binary = {_escape_ninja(bin_name)}',
+                  '')
+        self.units.append((bin_name, target_elf, base_elf))
 
         if self.roundtrip:
             self._relink(bin_name, [self.rel(config.split_dir / bin_name / f'{name}.o')
@@ -206,14 +242,32 @@ class _NinjaWriter:
                   '')
         self.default_targets.append(stamp)
 
+    def report(self):
+        """objdiff.json and the progress report measured from it.
+
+        Both are ninja outputs so a build with nothing changed skips them, and
+        their time shows in ninja's own log. objdiff.json's content is all in
+        its command line, which ninja rebuilds on when it changes.
+        """
+        if not self.units:
+            return
+        units = ' '.join(f'--unit {_escape_ninja(name)} {_escape_ninja(target)} '
+                         f'{_escape_ninja(base or "-")}' for name, target, base in self.units)
+        self.emit('build objdiff.json: objdiff_json',
+                  f'  units = {units}',
+                  '')
+        inputs = [t for _, t, _ in self.units] + [b for _, _, b in self.units if b]
+        report = self.rel(self.config.out_dir / 'report.json')
+        self.emit(f'build {_escape_ninja(report)}: report objdiff.json {_escape_all(inputs)}',
+                  '')
+        self.emit(f'build progress: phony {_escape_ninja(report)}', '')
+        self.default_targets.append(report)
+
     def regen(self, regen_args: str):
         """build.ninja, rebuilt from every object and the project's settings."""
-        config = self.config
-        inputs = [config.working_dir / 'cc.yaml', *config.originals,
-                  *(f for f in (config.working_dir / SYMBOLS_DIR).iterdir() if f.is_file()),
-                  *sorted(_PACKAGE_DIR.glob('*.py')), _BASE_LD, _LINKER_LD]
+        inputs = [*self.config_inputs(), self.rel(_BASE_LD), self.rel(_LINKER_LD)]
         self.emit(f'build build.ninja: regen {_escape_all(self.compile_targets)}'
-                  f' | {_escape_all([self.rel(p) for p in inputs])}',
+                  f' | {_escape_all(inputs)}',
                   f'  regen_args = {regen_args}',
                   '')
 
@@ -221,8 +275,9 @@ class _NinjaWriter:
         """The `compile` and `objdiff` aliases and the default targets."""
         if self.compile_targets:
             self.emit(f'build compile: phony {_escape_all(self.compile_targets)}', '')
-        if self.base_elf_targets:
-            self.emit(f'build objdiff: phony {_escape_all(self.base_elf_targets)}', '')
+        if self.units:
+            elfs = self.base_elf_targets + [t for _, t, _ in self.units]
+            self.emit(f'build objdiff: phony {_escape_all(elfs)} objdiff.json', '')
         if self.default_targets:
             self.emit(f'default {_escape_all(self.default_targets)}', '')
 
@@ -237,7 +292,7 @@ def manifest_header(config: ProjectConfig, roundtrip: bool) -> str:
     files = sorted(f'{b}/{config.src_key(b, s)}'
                    for b, srcs in config.sources.items() for s in srcs)
     digest = hashlib.sha1('\n'.join(files).encode()).hexdigest()[:16]
-    return (f'# 3dsd manifest v2 roundtrip={int(roundtrip)} '
+    return (f'# 3dsd manifest v3 roundtrip={int(roundtrip)} '
             f'binary={config.single_binary or "*"} sources={digest}')
 
 
@@ -256,9 +311,10 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
     """Generate build.ninja for the project.
 
     By default the graph carries only what decomp progress needs: each source
-    compiled to its own object, and those objects linked into the objdiff base
-    ELF. The objdiff target is built from the original binary and the symbol
-    CSV, so nothing in the progress path needs the split.
+    compiled to its own object, those objects linked into the objdiff base
+    ELF, the objdiff target cut from the original binary and the symbol CSV,
+    objdiff.json, and objdiff-cli's report on them (out/report.json). Nothing
+    in the progress path needs the split.
 
     Objects not compiled yet contribute no symbols; build.ninja depends on
     them, so ninja compiles them and regenerates it before linking anything.
@@ -298,6 +354,7 @@ def generate_ninja(config: ProjectConfig, roundtrip: bool = False):
              *_RULES)
     for bin_name, binary in config.binaries.items():
         out.binary(bin_name, binary)
+    out.report()
     out.regen(regen_args)
     out.phonies()
 

@@ -17,7 +17,7 @@ from .ctrtype import CRO, CTRBinary
 from .datasplit import POOL_SEGMENT, pool_section, split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
 from .reloc import BaseObject, RelocRecovery, read_base
-from .util import Symbol, posix, sanitize
+from .util import Symbol, listing, posix, sanitize, warn
 
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _STD_OUTPUT_HANDLE = -11
@@ -249,7 +249,7 @@ def build_target(config: ProjectConfig, name: str,  # pylint: disable=too-many-a
     if scope is not None:
         syms = _apply_scope(syms, scope)
     data, relocs, mapping, rel_note = _recover_relocs(base, binary, csv, syms, marks,
-                                                      warn=scope is None)
+                                                      check_marks=scope is None)
     out.parent.mkdir(parents=True, exist_ok=True)
     write_target_elf(out, data, syms, relocs, marks.mapping + mapping)
     if scope is None:
@@ -350,12 +350,9 @@ def _place_markers(name: str, csv: list[Symbol], markers: list[Symbol],  # pylin
             trailing.append(Symbol(mark.addr, f'pool_{base_addr + mark.addr:08x}', '$d',
                                    end - mark.addr, mark.segment, mark.namespace))
     if overruns:
-        print(f"  Warning: {name}: {len(overruns):,} mapping row(s) whose Size runs past the "
-              f"next marker or symbol; cut short there:")
-        for line in overruns[:5]:
-            print(f"    {line}")
-        if len(overruns) > 5:
-            print(f"    ... and {len(overruns) - 5:,} more")
+        warn(f"{name}: {len(overruns):,} mapping row(s) whose Size runs past the "
+             f"next marker or symbol; cut short there:",
+             listing(overruns, '    '))
     return csv + trailing, out
 
 
@@ -428,12 +425,9 @@ def _warn_unmarked(name: str, syms: list[Symbol], base: BaseObject, marked: set[
                                       and base.has_inner_data(twin)))]
     if not missing:
         return
-    print(f"  Warning: {name}: {len(missing):,} decompiled function(s) hold data (a "
-          f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:")
-    for sym in missing[:5]:
-        print(f"    {base_addr + sym.addr:08x} {sym.name}")
-    if len(missing) > 5:
-        print(f"    ... and {len(missing) - 5:,} more")
+    warn(f"{name}: {len(missing):,} decompiled function(s) hold data (a "
+         f"literal pool) the CSV does not mark; add $d/$a/$t mapping rows:",
+         listing([f"{base_addr + sym.addr:08x} {sym.name}" for sym in missing], '    '))
 
 
 def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[str]):
@@ -453,26 +447,26 @@ def _warn_unnamed(name: str, syms: list[Symbol], base_addr: int, compiled: set[s
     code = [p for p in pads if p.segment == '.text']
     code_bytes = sum(p.size for p in code)
     data_bytes = sum(p.size for p in pads) - code_bytes
-    print(f"  Warning: {name}: {len(pads):,} region(s) the symbol CSV does not name "
-          f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
-          f"Label them as $a/$t/$d in the CSV.")
     previous = {}
     for before, sym in itertools.pairwise(syms):
         previous[sym.addr] = before
     after_compiled = [p for p in code
                       if previous.get(p.addr) is not None and previous[p.addr].name in compiled]
+    details = []
     if after_compiled:
-        print(f"    {len(after_compiled):,} directly follow a decompiled function "
-              f"(likely its literal pool, left uncompared):")
-        for pad in after_compiled[:5]:
-            print(f"      {base_addr + pad.addr:08x} +{pad.size:<5} after "
-                  f"{previous[pad.addr].name}")
-        if len(after_compiled) > 5:
-            print(f"      ... and {len(after_compiled) - 5:,} more")
+        details = [(f"    {len(after_compiled):,} directly follow a decompiled function "
+                    f"(likely its literal pool, left uncompared):"),
+                   *listing([f"{base_addr + pad.addr:08x} +{pad.size:<5} after "
+                              f"{previous[pad.addr].name}" for pad in after_compiled],
+                             '      ')]
+    warn(f"{name}: {len(pads):,} region(s) the symbol CSV does not name "
+         f"({code_bytes:,} bytes counted as code, {data_bytes:,} as data). "
+         f"Label them as $a/$t/$d in the CSV.", details)
 
 
 def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disable=too-many-arguments,too-many-positional-arguments
-                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers", warn: bool = True):
+                    csv: list[Symbol], syms: list[Symbol], marks: "_Markers",
+                    check_marks: bool = True):
     """`(data, relocs, mapping, note)`: the target's bytes, relocations and
     literal-pool mapping symbols, recovered against its base."""
     if base is None:
@@ -483,7 +477,7 @@ def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disab
                              pointers=not isinstance(binary.binary, CRO))
     recovery.marked = marks.functions
     data, relocs = recovery.run(syms)
-    if warn:
+    if check_marks:
         _warn_unmarked(binary.name, syms, base, marks.functions, binary.base_addr)
     note = f", {len(relocs):,} relocations"
     if recovery.unresolved:
@@ -492,7 +486,10 @@ def _recover_relocs(base: BaseObject | None, binary: CTRBinary,  # pylint: disab
 
 
 def generate_objdiff(config: ProjectConfig):
-    """Generate objdiff.json for decomp progress tracking."""
+    """Generate the target ELFs and objdiff.json for decomp progress tracking.
+
+    A build does the same through ninja (ninja.py); this is the by-hand path.
+    """
     generate_target_elfs(config)
 
     units = []
@@ -500,29 +497,33 @@ def generate_objdiff(config: ProjectConfig):
         target_path = _rel(config.out_dir / 'objdiff_target' / name, config.working_dir)
         base_elf = config.out_dir / 'objdiff_base' / name
         if not base_elf.exists() and config.sources.get(name):
-            print(f"  Warning: no base ELF for {name}: the objdiff base link "
-                  f"has not run or failed. Progress will read as 0%; run "
-                  f"'ninja objdiff' and check the LINK_BASE output.")
-        unit = {
-            "name": name,
-            "target_path": posix(target_path),
-            "base_path": posix(_rel(base_elf, config.working_dir)) if base_elf.exists() else None,
-            "metadata": {
-                "progress_categories": [name],
-            },
-        }
-        units.append(unit)
+            warn(f"no base ELF for {name}: the objdiff base link "
+                 f"has not run or failed. Progress will read as 0%; run "
+                 f"'ninja objdiff' and check the LINK_BASE output.")
+        base_path = _rel(base_elf, config.working_dir) if base_elf.exists() else None
+        units.append((name, posix(target_path), posix(base_path) if base_path else None))
+    out_path = config.working_dir / 'objdiff.json'
+    write_objdiff_json(out_path, units)
+    print(f"Generated {out_path}")
 
+
+def write_objdiff_json(path: Path, units: list[tuple[str, str, str | None]]):
+    """Write an objdiff project of `(name, target_path, base_path)` units.
+
+    Paths are relative to the file's directory; a unit without a base has
+    nothing compiled yet and reads as 0%.
+    """
     objdiff = {
         "$schema": "https://raw.githubusercontent.com/encounter/objdiff/main/config.schema.json",
         "build_target": False,
         "build_base": False,
-        "units": units,
-        "progress_categories": [{"id": n, "name": n} for n in config.binaries],
+        "units": [{"name": name, "target_path": target, "base_path": base,
+                   "metadata": {"progress_categories": [name]}}
+                  for name, target, base in units],
+        "progress_categories": [{"id": u[0], "name": u[0]} for u in units],
     }
-    out_path = config.working_dir / 'objdiff.json'
-    out_path.write_text(json.dumps(objdiff, indent=2))
-    print(f"Generated {out_path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(objdiff, indent=2))
 
 
 _COLUMNS = ('Binary', 'Code bytes', 'Code %', 'Fuzzy Code %',
@@ -680,7 +681,7 @@ def supports_color(stream=None) -> bool:
         try:
             kernel32 = ctypes.windll.kernel32
             handle = kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
-            mode = ctypes.c_ulong()
+            mode = ctypes.c_ulong(0)
             if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
                 return False
             vt_mode = mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING
@@ -746,53 +747,58 @@ def format_table(rows: list[list[tuple]], total_row: list[tuple] | None = None,
     return '\n'.join(parts)
 
 
-def find_objdiff_cli(config: ProjectConfig) -> str | None:
-    """objdiff-cli on PATH, else in tools/."""
+def find_objdiff_cli(tool_dir: Path) -> str | None:
+    """objdiff-cli on PATH, else in the project's tools/ directory."""
     cli = shutil.which('objdiff-cli')
     if not cli:
         for name in ('objdiff-cli', 'objdiff-cli.exe'):
-            candidate = config.tool_dir / name
+            candidate = tool_dir / name
             if candidate.exists():
                 return str(candidate)
     return cli
 
 
-def report_progress(config: ProjectConfig, project_dir: Path | None = None,
-                    detail: bool = False):
-    """Report decomp progress using objdiff-cli.
+def generate_report(tool_dir: Path, project_dir: Path, report_path: Path) -> bool:
+    """Run objdiff-cli on the objdiff.json in `project_dir`, saving its report.
 
-    `project_dir` is the directory holding objdiff.json (the project's own by
-    default; a partial build writes its own). With `detail`, every measured
-    function and data section is listed with its match too.
+    Returns whether `report_path` now holds a fresh report. On any failure it
+    is removed, so a stale report is never read as this build's.
     """
-    cli = find_objdiff_cli(config)
+    cli = find_objdiff_cli(tool_dir)
     if not cli:
+        report_path.unlink(missing_ok=True)
         print("  objdiff-cli not found — install it for progress reporting.")
-        return
-    project_dir = project_dir or config.working_dir
-    report_dir = config.out_dir if project_dir == config.working_dir else project_dir
+        return False
 
     # Pretty-printed so the saved report.json is readable and diffs line by
-    # line; json.loads below does not care either way.
+    # line; json.loads does not care either way.
     result = subprocess.run([cli, 'report', 'generate', '--format', 'json-pretty'],
                             cwd=project_dir, capture_output=True, text=True,
                             check=False)
     if result.returncode != 0:
+        report_path.unlink(missing_ok=True)
         stderr = result.stderr.strip()
         msg = stderr.splitlines()[-1] if stderr else 'unknown error'
         print(f"  objdiff-cli failed: {msg}")
-        return
+        return False
 
-    # Persist the full report before parsing: only a few summary fields are
-    # printed, and the per-symbol detail is useful for inspection and diffing.
-    # Written verbatim so it matches what objdiff-cli produces elsewhere (CI).
-    report_path = report_dir / 'report.json'
+    # Persisted whole: only a few summary fields are printed, and the
+    # per-symbol detail is useful for inspection and diffing. Written verbatim
+    # so it matches what objdiff-cli produces elsewhere (CI).
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(result.stdout)
-    print(f"  Full report: {report_path}")
+    return True
 
+
+def print_report(report_path: Path, detail: bool = False):
+    """Print the progress table from a saved report.
+
+    With `detail`, every measured function and data section is listed with
+    its match too.
+    """
+    print(f"  Full report: {report_path}")
     try:
-        report = json.loads(result.stdout)
+        report = json.loads(report_path.read_text())
     except json.JSONDecodeError:
         print("  objdiff-cli produced unparseable output")
         return
@@ -809,6 +815,20 @@ def report_progress(config: ProjectConfig, project_dir: Path | None = None,
     print(format_table(rows, total))
     if detail:
         print(format_detail(units))
+
+
+def report_progress(config: ProjectConfig, project_dir: Path | None = None,
+                    detail: bool = False):
+    """Generate and print a progress report using objdiff-cli.
+
+    `project_dir` is the directory holding objdiff.json (the project's own by
+    default; a partial build writes its own).
+    """
+    project_dir = project_dir or config.working_dir
+    report_dir = config.out_dir if project_dir == config.working_dir else project_dir
+    report_path = report_dir / 'report.json'
+    if generate_report(config.tool_dir, project_dir, report_path):
+        print_report(report_path, detail)
 
 
 def format_detail(units: list[dict], color: bool | None = None) -> str:

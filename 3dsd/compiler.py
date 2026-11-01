@@ -3,12 +3,11 @@
 import os
 import re
 import subprocess
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from .elf import ELFHeader, SectionHeaderFlags, SectionHeaderType
-from .util import BinaryReader, get_name
+from .util import ORANGE, RED, RESET, BinaryReader, get_name, use_color
 
 _GRP_COMDAT = 0x1
 _STT_OBJECT = 1
@@ -89,17 +88,13 @@ def describe(source: Path, text: str, returncode: int) -> str:
     if not lines or not _SUMMARY.search(lines[-1]):
         lines.append(f"{source.as_posix()}: {warnings} warning{'s' if warnings != 1 else ''}, "
                      f"{errors} error{'s' if errors != 1 else ''}")
-    if not _use_color():
+    if not use_color():
         return '\n'.join(lines)
     if failed:
         return f"{RED}{chr(10).join(lines)}{RESET}"
     return '\n'.join([*lines[:-1], f'{ORANGE}{lines[-1]}{RESET}'])
 
 
-#: ANSI colours for the compile summary: red for errors, orange for warnings.
-RED = '\x1b[31m'
-ORANGE = '\x1b[38;5;208m'
-RESET = '\x1b[0m'
 
 _SUMMARY = re.compile(r'(\d+) warnings?, (\d+) errors?')
 
@@ -127,7 +122,7 @@ def summarize(source: Path, text: str, returncode: int) -> str:
     tally (the compiler could not start, say) counts as an error too.
     """
     warnings, errors = count_diagnostics(text)
-    color = _use_color()
+    color = use_color()
     if errors or returncode != 0:
         body = text.rstrip() or f'{source.as_posix()}: compiler exited with {returncode}'
         return f'{RED}{body}{RESET}' if color else body
@@ -137,12 +132,6 @@ def summarize(source: Path, text: str, returncode: int) -> str:
     return ''
 
 
-def _use_color() -> bool:
-    """Colour unless NO_COLOR; forced under `3dsd build`, which reads ninja's
-    output through a pipe and sets CLICOLOR_FORCE so the escapes survive."""
-    if os.environ.get('NO_COLOR'):
-        return False
-    return bool(os.environ.get('CLICOLOR_FORCE')) or sys.stdout.isatty()
 
 
 def _cc_env(cc: Path) -> dict:
