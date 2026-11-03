@@ -90,8 +90,7 @@ SKIP_SEGMENT = '.undecompiled'
 
 
 def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
-                split: dict[str, str] | None = None,
-                pools: set[str] | None = None) -> list[Symbol]:
+                split: dict[str, str] | None = None) -> list[Symbol]:
     """Send each data symbol to the section that lets it pair, or out of the way.
 
     A decompiled object takes the section armcc put the base's copy in, not the
@@ -105,16 +104,18 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
     scores, alone.
 
     A `$d` label in .text is data too, never a function. Every one between a
-    function whose compiled pool the base has split out (`pools`) and the next
-    code symbol belongs to that function's literal pool and goes to the same
-    `.pool:<function>` section, so the two are compared; any other goes with
+    function and the next code symbol belongs to that function's literal pool
+    and goes to its `.pool:<function>` section, whether or not the compiled
+    function has a pool yet: the CSV says the pool is there, so it is measured
+    from the start, and a base without one simply scores nothing against it.
+    Only a library function's pool, or a label before any function, goes with
     the undecompiled data.
 
     Applied before the gaps are filled, so the padding between two undecompiled
     data objects inherits the skipped segment too and stays out of the diff.
     """
     split = split or {}
-    owners = _pool_owners(symbols, pools or set())
+    owners = _pool_owners(symbols)
     out = []
     for sym in symbols:
         if sym.segment == '.text' and sym.mode == '$d':
@@ -136,15 +137,15 @@ def _route_data(symbols: list[Symbol], decompiled: dict[str, str],
     return out
 
 
-def _pool_owners(symbols: list[Symbol], pools: set[str]) -> dict[int, str]:
-    """`{id(label): function}` for each `$d` label in .text that follows a
-    function in `pools`, up to the next code symbol."""
+def _pool_owners(symbols: list[Symbol]) -> dict[int, str]:
+    """`{id(label): function}` for each `$d` label in .text, up to the next
+    code symbol: the function before it. Library functions own none."""
     owners: dict[int, str] = {}
     text = sorted((s for s in symbols if s.segment == '.text'), key=lambda s: s.addr)
     owner = None
     for sym in text:
         if sym.mode in ('$a', '$t'):
-            owner = sym.name if sym.name in pools else None
+            owner = sym.name if sym.name and not sym.is_stdlib else None
         elif owner is not None:
             owners[id(sym)] = owner
     return owners
@@ -234,9 +235,7 @@ def build_target(config: ProjectConfig, name: str,  # pylint: disable=too-many-a
                                 config.markers.get(name, []), len(data), binary.base_addr)
     base = read_base(base_path.read_bytes()) if base_path.exists() else None
     split = split_sections_of(base.names) if base is not None else {}
-    pools = {n.partition(':')[2] for n in base.names
-             if n.startswith(POOL_SEGMENT + ':')} if base is not None else set()
-    raw = _route_data(csv, decompiled, split, pools)
+    raw = _route_data(csv, decompiled, split)
     syms = _keep_text_gaps(_skip_data_padding(_complete_symbols(raw, len(data))), csv)
     if scope is None:
         _warn_unnamed(name, syms, binary.base_addr,
