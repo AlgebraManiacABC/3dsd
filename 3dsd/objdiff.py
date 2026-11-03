@@ -841,7 +841,7 @@ def format_detail(units: list[dict], color: bool | None = None) -> str:
         items += [(s.get('name', '?'), int(s.get('size', 0)), s.get('fuzzy_match_percent'))
                   for s in unit.get('sections', []) if ':' in s.get('name', '')
                   and not s.get('name', '').startswith('.text:')]
-        for item_name, size, pct in items:
+        for item_name, size, pct in sorted(items, key=lambda x: x[0]):
             pct = float(pct or 0.0)
             cell = _paint(f'{pct:8.2f}%', pct / 100, color)
             lines.append(f'  {cell}  {size:>6}  {item_name}')

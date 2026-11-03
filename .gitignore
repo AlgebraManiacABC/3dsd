@@ -12,3 +12,4 @@ objdiff.json
 *.egg-info/
 dist/
 .claude/
+.idea/
