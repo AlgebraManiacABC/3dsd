@@ -17,7 +17,7 @@ from .ctrtype import CRO, CTRBinary
 from .datasplit import POOL_SEGMENT, pool_section, split_data_objects, split_sections_of
 from .elf import SectionHeaderType, write_target_elf
 from .reloc import BaseObject, RelocRecovery, read_base
-from .util import Symbol, listing, posix, sanitize, warn
+from .util import Symbol, listing, posix, sanitize, use_color, warn
 
 _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 _STD_OUTPUT_HANDLE = -11
@@ -811,9 +811,10 @@ def print_report(report_path: Path, detail: bool = False):
     all_sections = [s for u in units for s in u.get('sections', [])]
     total = (measure_row(report.get('measures', {}), 'Total', all_sections)
              if len(units) > 1 else None)
-    print(format_table(rows, total))
+    color = supports_color() or use_color()
+    print(format_table(rows, total, color))
     if detail:
-        print(format_detail(units))
+        print(format_detail(units, color))
 
 
 def report_progress(config: ProjectConfig, project_dir: Path | None = None,
