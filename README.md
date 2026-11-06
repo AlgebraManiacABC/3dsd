@@ -343,6 +343,9 @@ a base of their own, and the target measures only the symbols they define
 The report lists each function and data object with its match. Everything
 goes to `out/partial/`: `build.ninja`, the project's `objdiff.json`, its
 base and target and `out/report.json` stay as the last full build left them.
+As in a full build, a file that fails to compile fails the build: every
+selected file is still compiled, so all the errors show at once, but nothing
+is linked or reported.
 
 ```bash
 python -m 3dsd build . --roundtrip

@@ -58,6 +58,13 @@ def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -
 
     _print(f"=== Compile ({len(selected)} file{'s' if len(selected) != 1 else ''}) ===")
     objects, failed = _compile(config, selected, jobs)
+    # A failed compile fails the build, as in a full one. Measuring what did
+    # compile would drop the failed file's symbols from the totals, and the
+    # report would show a smaller denominator as if it were the real one.
+    if failed:
+        _print(f"Build failed: {failed} file{'s' if failed != 1 else ''} did not compile; "
+               f"no progress reported.")
+        return False
 
     out_dir = config.out_dir / PARTIAL_DIR
     units = []
@@ -95,7 +102,7 @@ def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -
 
     _print("=== Progress ===")
     report_progress(config, project_dir=out_dir, detail=True)
-    return not failed
+    return True
 
 
 def _within(path: Path, scope: Path) -> bool:
