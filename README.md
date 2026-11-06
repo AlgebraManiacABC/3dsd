@@ -332,6 +332,7 @@ itself, and only that part is built and measured:
 ```bash
 python -m 3dsd build src/code.bin/Item              # every source under Item/
 python -m 3dsd build src/code.bin/Item/Item.c       # one file
+python -m 3dsd build src/code.bin/Item/Item.c src/code.bin/Item/Bag.c   # several files (or directories)
 python -m 3dsd build src/code.bin/Item/Item.c --symbol Item_Clear   # one symbol of it
 ```
 

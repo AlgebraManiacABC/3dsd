@@ -14,7 +14,9 @@ warnings that matter are lost among thousands of others. A partial build:
   resolve, but nothing outside the scope counts (`objdiff._apply_scope`);
 * reports on that alone, symbol by symbol.
 
-`--symbol` narrows the measurement to one symbol of the file.
+Several paths can be given at once; the sources under any of them are
+built and measured together. `--symbol` narrows the measurement to one
+symbol of them.
 
 Nothing outside `out/partial/` is touched: build.ninja, the project's own
 objdiff.json, base and target, and the full report all stay as the last
@@ -48,13 +50,13 @@ def find_project_root(path: Path) -> Path | None:
     return None
 
 
-def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -> bool:
-    """Compile, link, cut and report on the sources under `scope`."""
+def run_partial(root: Path, scopes: list[Path], jobs: int | None, symbol: str | None) -> bool:
+    """Compile, link, cut and report on the sources under any of `scopes`."""
     config = ProjectConfig.load(root)
     selected = [(bin_name, src) for bin_name, sources in config.sources.items()
-                for src in sources if _within(src, scope)]
+                for src in sources if any(_within(src, scope) for scope in scopes)]
     if not selected:
-        raise PipelineError(f"No compilable source under {scope}.")
+        raise PipelineError("No compilable source under " + ", ".join(map(str, scopes)) + ".")
 
     _print(f"=== Compile ({len(selected)} file{'s' if len(selected) != 1 else ''}) ===")
     objects, failed = _compile(config, selected, jobs)
@@ -78,7 +80,7 @@ def run_partial(root: Path, scope: Path, jobs: int | None, symbol: str | None) -
         scope_names = set(defined)
         if symbol is not None:
             if symbol not in defined:
-                raise PipelineError(_missing_symbol(symbol, scope, sorted(defined)))
+                raise PipelineError(_missing_symbol(symbol, scopes, sorted(defined)))
             scope_names = {symbol}
         decompiled = {sanitize(n): seg for n, seg in defined.items() if seg != '.text'}
 
@@ -139,8 +141,9 @@ def _compile(config: ProjectConfig, selected: list[tuple[str, Path]],
     return objects, failed
 
 
-def _missing_symbol(symbol: str, scope: Path, defined: list[str]) -> str:
-    lines = [f"{scope.name} does not define {symbol}."]
+def _missing_symbol(symbol: str, scopes: list[Path], defined: list[str]) -> str:
+    names = ', '.join(scope.name for scope in scopes)
+    lines = [f"{names} {'does' if len(scopes) == 1 else 'do'} not define {symbol}."]
     if defined:
         shown = ', '.join(defined[:10])
         more = f", ... ({len(defined) - 10} more)" if len(defined) > 10 else ''

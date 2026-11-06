@@ -41,7 +41,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_build = sub.add_parser('build', help='Build the project, or part of it')
     p_build.add_argument('dir', metavar='path',
                          help='The project directory for a full build, or a directory or '
-                              'source file inside it to build and measure only that')
+                              'source file inside it to build and measure only that; '
+                              'further paths after it are built and measured with it')
     p_build.add_argument('--symbol', metavar='NAME',
                          help='With a source file: measure only this symbol of it')
     p_build.add_argument('-j', '--jobs', type=int, default=None,
@@ -54,7 +55,8 @@ def _build_parser() -> argparse.ArgumentParser:
                               'tests the pipeline, not the decomp, and costs a '
                               'split and link of every symbol in every binary')
     p_build.add_argument('targets', nargs='*', default=None,
-                         help='Ninja targets (e.g. "compile")')
+                         help='Full build: ninja targets (e.g. "compile"). '
+                              'Partial build: more directories or source files')
 
     project_command('check', 'Verify recreated binaries against originals')
 
