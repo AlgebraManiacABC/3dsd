@@ -332,6 +332,7 @@ itself, and only that part is built and measured:
 ```bash
 python -m 3dsd build src/code.bin/Item              # every source under Item/
 python -m 3dsd build src/code.bin/Item/Item.c       # one file
+python -m 3dsd build src/code.bin/Item/Item.c src/code.bin/Item/Bag.c   # several files (or directories)
 python -m 3dsd build src/code.bin/Item/Item.c --symbol Item_Clear   # one symbol of it
 ```
 
@@ -343,6 +344,9 @@ a base of their own, and the target measures only the symbols they define
 The report lists each function and data object with its match. Everything
 goes to `out/partial/`: `build.ninja`, the project's `objdiff.json`, its
 base and target and `out/report.json` stay as the last full build left them.
+As in a full build, a file that fails to compile fails the build: every
+selected file is still compiled, so all the errors show at once, but nothing
+is linked or reported.
 
 ```bash
 python -m 3dsd build . --roundtrip

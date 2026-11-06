@@ -36,17 +36,27 @@ def run_build(path: Path, jobs: int | None, keep_going: bool,  # pylint: disable
 
     The project directory itself is a full build. A directory or file inside
     a project is a partial one (partial.py): only the sources under it are
-    compiled and measured. `symbol` narrows a partial build to one symbol.
+    compiled and measured. In a partial build `targets` are more such paths,
+    measured together with `path`. `symbol` narrows it to one symbol.
     """
     root = find_project_root(path)
     if root is None:
         raise PipelineError(f"{path} is not in a 3dsd project (no cc.yaml and symbols/ "
                             f"in it or any directory above).")
     if path.resolve() != root:
-        if roundtrip or targets:
-            raise PipelineError("--roundtrip and ninja targets apply to a full build; "
+        # Every argument after a path inside the project is another such path:
+        # ninja targets mean nothing to a partial build.
+        scopes = [path, *(Path(t) for t in targets or [])]
+        for scope in scopes:
+            if not scope.exists():
+                raise PipelineError(f"{scope} does not exist.")
+            if find_project_root(scope) != root or scope.resolve() == root:
+                raise PipelineError(f"{scope} is not a directory or file inside {root}; "
+                                    f"a partial build takes only paths within the project.")
+        if roundtrip:
+            raise PipelineError("--roundtrip applies to a full build; "
                                 "give the project directory for one.")
-        return run_partial(root, path.resolve(), jobs, symbol)
+        return run_partial(root, [s.resolve() for s in scopes], jobs, symbol)
     if symbol is not None:
         raise PipelineError(f"--symbol needs the file that defines it: "
                             f"build <path/to/source.c> --symbol {symbol}")
